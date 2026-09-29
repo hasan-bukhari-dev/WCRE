@@ -2,8 +2,8 @@ use std::env;
 use std::process::ExitCode;
 
 use wcre_win32::{
-    MemoryTypeReadSummary, capture_va_clone, compare_va_clone_memory, diff_va_clone_private_memory,
-    inspect_process, query_memory_map, read_process_memory,
+    MemoryTypeReadSummary, capture_thread_contexts, capture_va_clone, compare_va_clone_memory,
+    diff_va_clone_private_memory, inspect_process, query_memory_map, read_process_memory,
 };
 
 fn main() -> ExitCode {
@@ -39,6 +39,11 @@ fn run() -> Result<(), String> {
         Some("snapshot") => {
             let pid = parse_pid_arguments(args.collect(), "snapshot")?;
             run_snapshot(pid)
+        }
+
+        Some("snapshot-threads") => {
+            let pid = parse_pid_arguments(args.collect(), "snapshot-threads")?;
+            run_snapshot_threads(pid)
         }
 
         Some("snapshot-verify") => {
@@ -191,6 +196,104 @@ fn run_snapshot(pid: u32) -> Result<(), String> {
     println!("{:<21}{}", "Source PID:", snapshot.source_pid());
     println!("{:<21}{}", "VA clone PID:", snapshot.clone_pid());
     println!("{:<21}captured", "VA clone:");
+
+    Ok(())
+}
+
+fn run_snapshot_threads(pid: u32) -> Result<(), String> {
+    let report = capture_thread_contexts(pid)
+        .map_err(|error| format!("failed to capture PSS thread contexts for PID {pid}: {error}"))?;
+
+    println!("WCRE PSS Thread Context Probe");
+    println!();
+
+    println!("{:<24}{}", "Source PID:", report.source_pid);
+    println!("{:<24}{}", "VA clone PID:", report.clone_pid);
+    println!("{:<24}{}", "Thread entries:", report.threads.len());
+    println!("{:<24}{}", "Live threads:", report.live_threads());
+    println!(
+        "{:<24}{}",
+        "Terminated entries:",
+        report.terminated_threads()
+    );
+    println!("{:<24}{}", "Contexts captured:", report.contexts_captured());
+    println!(
+        "{:<24}{}",
+        "Live contexts:",
+        report.live_contexts_captured()
+    );
+    println!(
+        "{:<24}{}",
+        "Missing live contexts:",
+        report.missing_live_contexts()
+    );
+    println!(
+        "{:<24}{}",
+        "Complete live contexts:",
+        yes_no(report.complete_live_contexts())
+    );
+    println!(
+        "{:<24}{}",
+        "Lifecycle status:",
+        yes_no(report.lifecycle_status_consistent())
+    );
+
+    println!();
+    println!("Captured threads");
+    println!("----------------");
+    println!(
+        "{:<8} {:<11} {:<6} {:<10} {:<18} {:<18} {:>7} {:<18} {:<18} {:<18}",
+        "TID", "State", "Flags", "Exit", "TEB", "Start", "Suspend", "RIP", "RSP", "RBP"
+    );
+
+    for thread in &report.threads {
+        if let Some(context) = &thread.context {
+            println!(
+                "{:<8} {:<11} {:04X}   {:<10} {:016X}  {:016X}  {:>7} {:016X}  {:016X}  {:016X}",
+                thread.thread_id,
+                if thread.terminated {
+                    "TERMINATED"
+                } else {
+                    "LIVE"
+                },
+                thread.thread_flags,
+                thread.exit_status,
+                thread.teb_base_address,
+                thread.start_address,
+                thread.suspend_count,
+                context.rip,
+                context.rsp,
+                context.rbp,
+            );
+        } else {
+            println!(
+                "{:<8} {:<11} {:04X}   {:<10} {:016X}  {:016X}  {:>7} {}",
+                thread.thread_id,
+                if thread.terminated {
+                    "TERMINATED"
+                } else {
+                    "LIVE"
+                },
+                thread.thread_flags,
+                thread.exit_status,
+                thread.teb_base_address,
+                thread.start_address,
+                thread.suspend_count,
+                "NO CONTEXT",
+            );
+        }
+    }
+
+    if !report.complete_live_contexts() {
+        return Err(format!(
+            "{} live threads are missing contexts",
+            report.missing_live_contexts()
+        ));
+    }
+
+    if !report.lifecycle_status_consistent() {
+        return Err("PSS thread flag and exit-status classification disagreed".to_string());
+    }
 
     Ok(())
 }
@@ -432,6 +535,7 @@ fn print_help() {
     println!("  wcre-cli memory-map --pid <PID>");
     println!("  wcre-cli memory-read --pid <PID>");
     println!("  wcre-cli snapshot --pid <PID>");
+    println!("  wcre-cli snapshot-threads --pid <PID>");
     println!("  wcre-cli snapshot-verify --pid <PID>");
     println!("  wcre-cli snapshot-private-diff --pid <PID>");
 }
