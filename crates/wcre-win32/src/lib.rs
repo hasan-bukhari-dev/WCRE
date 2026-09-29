@@ -6,14 +6,16 @@
 //!
 //! No process restoration functionality is implemented yet.
 
+mod memory;
 mod process;
+
+pub use memory::{
+    MemoryMap, MemoryProtection, MemoryRegion, MemoryState, MemoryType, query_memory_map,
+};
 
 pub use process::{ProcessArchitecture, ProcessInfo, inspect_process};
 
-/// Human-readable name of the project.
 pub const PROJECT_NAME: &str = "WCRE";
-
-/// Current development milestone.
 pub const CURRENT_MILESTONE: &str = "M0 - Process State Capture";
 
 #[cfg(test)]

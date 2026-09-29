@@ -10,12 +10,11 @@ use windows::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_UNKNOWN,
 };
 use windows::Win32::System::Threading::{
-    IsWow64Process2, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW,
+    IsWow64Process2, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::core::PWSTR;
 
-/// Basic information WCRE can currently observe about a process.
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
     pub pid: u32,
@@ -24,7 +23,6 @@ pub struct ProcessInfo {
     pub native_architecture: ProcessArchitecture,
 }
 
-/// Processor architecture reported by Windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessArchitecture {
     X64,
@@ -48,14 +46,13 @@ impl fmt::Display for ProcessArchitecture {
     }
 }
 
-/// RAII wrapper around a Windows process HANDLE.
+/// Owned Windows process handle.
 ///
-/// WCRE owns the handle returned by OpenProcess, so it must always
-/// be closed when we finish inspecting the process.
-struct ProcessHandle(HANDLE);
+/// The HANDLE is closed automatically when this value goes out of scope.
+pub(crate) struct ProcessHandle(HANDLE);
 
 impl ProcessHandle {
-    fn raw(&self) -> HANDLE {
+    pub(crate) fn raw(&self) -> HANDLE {
         self.0
     }
 }
@@ -63,23 +60,26 @@ impl ProcessHandle {
 impl Drop for ProcessHandle {
     fn drop(&mut self) {
         // SAFETY:
-        // The handle was returned by OpenProcess and is owned by this object.
-        // Drop runs exactly once for this ProcessHandle.
+        // This HANDLE was returned by OpenProcess and is owned by this value.
         let _ = unsafe { CloseHandle(self.0) };
     }
 }
 
-/// Inspect a running Windows process.
-///
-/// M0 intentionally requests only PROCESS_QUERY_LIMITED_INFORMATION.
-/// We do not yet request VM_READ, VM_WRITE, PROCESS_ALL_ACCESS, or any
-/// checkpoint-related permissions.
-pub fn inspect_process(pid: u32) -> windows::core::Result<ProcessInfo> {
+/// Open a Windows process with exactly the requested access rights.
+pub(crate) fn open_process(
+    pid: u32,
+    access: PROCESS_ACCESS_RIGHTS,
+) -> windows::core::Result<ProcessHandle> {
     // SAFETY:
-    // OpenProcess is called with a valid PID value supplied by the caller.
-    // No raw pointers are passed here.
-    let handle =
-        ProcessHandle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)? });
+    // No raw pointers are involved. Windows validates the supplied PID and
+    // requested access mask.
+    let handle = unsafe { OpenProcess(access, false, pid)? };
+
+    Ok(ProcessHandle(handle))
+}
+
+pub fn inspect_process(pid: u32) -> windows::core::Result<ProcessInfo> {
+    let handle = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
 
     let image_path = query_image_path(handle.raw())?;
     let (architecture, native_architecture) = query_architecture(handle.raw())?;
@@ -92,18 +92,12 @@ pub fn inspect_process(pid: u32) -> windows::core::Result<ProcessInfo> {
     })
 }
 
-/// Retrieve the full Win32 executable path for a process.
 fn query_image_path(handle: HANDLE) -> windows::core::Result<PathBuf> {
-    // Windows extended-length paths are bounded well below this for the
-    // process-image query we are performing. Use a large fixed UTF-16 buffer
-    // for the initial M0 implementation; dynamic resizing can be added later
-    // if testing demonstrates a need for it.
     let mut buffer = vec![0u16; 32_768];
     let mut length = buffer.len() as u32;
 
     // SAFETY:
-    // `buffer` is writable for `length` UTF-16 elements.
-    // `length` remains alive and writable for the duration of the call.
+    // buffer points to writable UTF-16 storage containing `length` elements.
     unsafe {
         QueryFullProcessImageNameW(
             handle,
@@ -113,17 +107,11 @@ fn query_image_path(handle: HANDLE) -> windows::core::Result<PathBuf> {
         )?;
     }
 
-    let path = OsString::from_wide(&buffer[..length as usize]);
-
-    Ok(PathBuf::from(path))
+    Ok(PathBuf::from(OsString::from_wide(
+        &buffer[..length as usize],
+    )))
 }
 
-/// Determine both the target-process architecture and the native host
-/// architecture.
-///
-/// IsWow64Process2 returns IMAGE_FILE_MACHINE_UNKNOWN for the process-machine
-/// field when the target is already native. In that case, the target
-/// architecture is the native-machine value.
 fn query_architecture(
     handle: HANDLE,
 ) -> windows::core::Result<(ProcessArchitecture, ProcessArchitecture)> {
@@ -131,8 +119,7 @@ fn query_architecture(
     let mut native_machine = IMAGE_FILE_MACHINE_UNKNOWN;
 
     // SAFETY:
-    // Both pointers refer to valid writable IMAGE_FILE_MACHINE values
-    // that live until the function returns.
+    // Both output parameters point to valid writable values.
     unsafe {
         IsWow64Process2(handle, &mut process_machine, Some(&mut native_machine))?;
     }
