@@ -1,7 +1,7 @@
-﻿use std::env;
+use std::env;
 use std::process::ExitCode;
 
-use wcre_win32::inspect_process;
+use wcre_win32::{inspect_process, query_memory_map};
 
 fn main() -> ExitCode {
     match run() {
@@ -18,7 +18,15 @@ fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
 
     match args.next().as_deref() {
-        Some("inspect") => run_inspect(args.collect()),
+        Some("inspect") => {
+            let pid = parse_pid_arguments(args.collect(), "inspect")?;
+            run_inspect(pid)
+        }
+
+        Some("memory-map") => {
+            let pid = parse_pid_arguments(args.collect(), "memory-map")?;
+            run_memory_map(pid)
+        }
 
         Some("-h") | Some("--help") | None => {
             print_help();
@@ -31,20 +39,23 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn run_inspect(args: Vec<String>) -> Result<(), String> {
+fn parse_pid_arguments(args: Vec<String>, command: &str) -> Result<u32, String> {
     if args.len() != 2 || args[0] != "--pid" {
-        return Err("usage: wcre-cli inspect --pid <PID>".to_string());
+        return Err(format!("usage: wcre-cli {command} --pid <PID>"));
     }
 
-    let pid = args[1]
+    args[1]
         .parse::<u32>()
-        .map_err(|_| format!("invalid process ID '{}'", args[1]))?;
+        .map_err(|_| format!("invalid process ID '{}'", args[1]))
+}
 
+fn run_inspect(pid: u32) -> Result<(), String> {
     let process =
         inspect_process(pid).map_err(|error| format!("failed to inspect PID {pid}: {error}"))?;
 
     println!("WCRE Process Inspector");
     println!();
+
     println!("{:<21}{}", "PID:", process.pid);
     println!("{:<21}{}", "Image:", process.image_path.display());
     println!("{:<21}{}", "Architecture:", process.architecture);
@@ -56,11 +67,74 @@ fn run_inspect(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+fn run_memory_map(pid: u32) -> Result<(), String> {
+    let map = query_memory_map(pid)
+        .map_err(|error| format!("failed to query virtual memory for PID {pid}: {error}"))?;
+
+    println!("WCRE Virtual Memory Map");
+    println!("PID: {pid}");
+    println!();
+
+    println!(
+        "{:<18} {:<18} {:>12} {:<9} {:<9} {}",
+        "Base", "End", "Size", "State", "Type", "Protect"
+    );
+
+    println!(
+        "{:-<18} {:-<18} {:->12} {:-<9} {:-<9} {:-<10}",
+        "", "", "", "", "", ""
+    );
+
+    for region in &map.regions {
+        println!(
+            "{:016X}  {:016X}  {:>12} {:<9} {:<9} {}",
+            region.base_address,
+            region.end_address(),
+            format_size(region.region_size as u64),
+            region.state,
+            region.kind,
+            region.protection,
+        );
+    }
+
+    println!();
+    println!("Summary");
+    println!("-------");
+    println!("{:<20}{}", "Regions:", map.regions.len());
+    println!("{:<20}{}", "Committed:", format_size(map.committed_bytes));
+    println!("{:<20}{}", "Reserved:", format_size(map.reserved_bytes));
+    println!("{:<20}{}", "Private:", format_size(map.private_bytes));
+    println!("{:<20}{}", "Mapped:", format_size(map.mapped_bytes));
+    println!("{:<20}{}", "Image:", format_size(map.image_bytes));
+
+    Ok(())
+}
+
+fn format_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    let bytes_f = bytes as f64;
+
+    if bytes_f >= GIB {
+        format!("{:.2} GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.2} MiB", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.2} KiB", bytes_f / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn print_help() {
     println!("WCRE - Windows Checkpoint/Restore Engine");
     println!("Version: 0.0.1-dev");
     println!("Milestone: M0 - Process State Capture");
     println!();
+
     println!("Usage:");
     println!("  wcre-cli inspect --pid <PID>");
+    println!("  wcre-cli memory-map --pid <PID>");
 }
