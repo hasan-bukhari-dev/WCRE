@@ -1,0 +1,17 @@
+﻿/target/
+**/target/
+
+.vs/
+.vscode/
+.idea/
+
+*.exe
+*.pdb
+*.obj
+*.ilk
+
+*.wcr
+*.dmp
+
+.DS_Store
+Thumbs.db
