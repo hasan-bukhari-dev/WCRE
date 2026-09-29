@@ -2,10 +2,12 @@ use std::ffi::c_void;
 use std::mem::size_of;
 
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_ALL_AMD64, ReadProcessMemory};
 use windows::Win32::System::Diagnostics::ProcessSnapshotting::{
-    HPSS, PSS_CAPTURE_VA_CLONE, PSS_QUERY_VA_CLONE_INFORMATION, PSS_VA_CLONE_INFORMATION,
-    PssCaptureSnapshot, PssFreeSnapshot, PssQuerySnapshot,
+    HPSS, HPSSWALK, PSS_CAPTURE_THREAD_CONTEXT, PSS_CAPTURE_THREADS, PSS_CAPTURE_VA_CLONE,
+    PSS_QUERY_VA_CLONE_INFORMATION, PSS_THREAD_ENTRY, PSS_VA_CLONE_INFORMATION, PSS_WALK_THREADS,
+    PssCaptureSnapshot, PssFreeSnapshot, PssQuerySnapshot, PssWalkMarkerCreate, PssWalkMarkerFree,
+    PssWalkSnapshot,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetProcessId, PROCESS_CREATE_PROCESS, PROCESS_QUERY_INFORMATION,
@@ -59,15 +61,17 @@ pub fn capture_va_clone(pid: u32) -> windows::core::Result<VaCloneSnapshot> {
 
     let mut snapshot_handle = HPSS::default();
 
+    let capture_flags = PSS_CAPTURE_VA_CLONE | PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT;
+
     // SAFETY:
     // - process is a valid process handle.
     // - snapshot_handle points to writable HPSS storage.
-    // - no thread context is requested for this experiment.
+    // - the thread-context flags request the standard x64 CONTEXT groups.
     let result = unsafe {
         PssCaptureSnapshot(
             process.raw(),
-            PSS_CAPTURE_VA_CLONE,
-            None,
+            capture_flags,
+            Some(CONTEXT_ALL_AMD64.0),
             &mut snapshot_handle,
         )
     };
@@ -155,6 +159,221 @@ pub fn compare_va_clone_memory(pid: u32) -> windows::core::Result<SnapshotMemory
         clone_pid: snapshot.clone_pid(),
         first,
         second,
+    })
+}
+
+const ERROR_NO_MORE_ITEMS_CODE: u32 = 259;
+const PSS_THREAD_FLAGS_TERMINATED_VALUE: i32 = 0x0001;
+const STILL_ACTIVE_CODE: u32 = 259;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct X64RegisterContext {
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub eflags: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotThread {
+    pub process_id: u32,
+    pub thread_id: u32,
+    pub teb_base_address: usize,
+    pub start_address: usize,
+    pub terminated: bool,
+    pub thread_flags: i32,
+    pub exit_status: u32,
+    pub suspend_count: u16,
+    pub priority: i32,
+    pub base_priority: i32,
+    pub context_size: u16,
+    pub context: Option<X64RegisterContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotThreadReport {
+    pub source_pid: u32,
+    pub clone_pid: u32,
+    pub threads: Vec<SnapshotThread>,
+}
+
+impl SnapshotThreadReport {
+    pub fn contexts_captured(&self) -> usize {
+        self.threads
+            .iter()
+            .filter(|thread| thread.context.is_some())
+            .count()
+    }
+
+    pub fn live_threads(&self) -> usize {
+        self.threads
+            .iter()
+            .filter(|thread| !thread.terminated)
+            .count()
+    }
+
+    pub fn terminated_threads(&self) -> usize {
+        self.threads
+            .iter()
+            .filter(|thread| thread.terminated)
+            .count()
+    }
+
+    pub fn live_contexts_captured(&self) -> usize {
+        self.threads
+            .iter()
+            .filter(|thread| !thread.terminated && thread.context.is_some())
+            .count()
+    }
+
+    pub fn missing_live_contexts(&self) -> usize {
+        self.threads
+            .iter()
+            .filter(|thread| !thread.terminated && thread.context.is_none())
+            .count()
+    }
+
+    pub fn complete_live_contexts(&self) -> bool {
+        self.live_threads() > 0 && self.missing_live_contexts() == 0
+    }
+
+    pub fn lifecycle_status_consistent(&self) -> bool {
+        self.threads.iter().all(|thread| {
+            if thread.terminated {
+                thread.exit_status != STILL_ACTIVE_CODE
+            } else {
+                thread.exit_status == STILL_ACTIVE_CODE
+            }
+        })
+    }
+
+    pub fn complete_contexts(&self) -> bool {
+        !self.threads.is_empty() && self.contexts_captured() == self.threads.len()
+    }
+}
+
+struct SnapshotWalkMarker(HPSSWALK);
+
+impl Drop for SnapshotWalkMarker {
+    fn drop(&mut self) {
+        let _ = unsafe { PssWalkMarkerFree(self.0) };
+    }
+}
+
+fn create_walk_marker() -> windows::core::Result<SnapshotWalkMarker> {
+    let mut marker = HPSSWALK::default();
+
+    let result = unsafe { PssWalkMarkerCreate(None, &mut marker) };
+    win32_result(result)?;
+
+    Ok(SnapshotWalkMarker(marker))
+}
+
+fn copy_x64_register_context(context: &CONTEXT) -> X64RegisterContext {
+    X64RegisterContext {
+        rax: context.Rax,
+        rbx: context.Rbx,
+        rcx: context.Rcx,
+        rdx: context.Rdx,
+        rsi: context.Rsi,
+        rdi: context.Rdi,
+        r8: context.R8,
+        r9: context.R9,
+        r10: context.R10,
+        r11: context.R11,
+        r12: context.R12,
+        r13: context.R13,
+        r14: context.R14,
+        r15: context.R15,
+        rip: context.Rip,
+        rsp: context.Rsp,
+        rbp: context.Rbp,
+        eflags: context.EFlags,
+    }
+}
+
+fn walk_snapshot_threads(snapshot_handle: HPSS) -> windows::core::Result<Vec<SnapshotThread>> {
+    let marker = create_walk_marker()?;
+    let mut threads = Vec::new();
+
+    loop {
+        let mut entry = PSS_THREAD_ENTRY::default();
+
+        let entry_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                (&mut entry as *mut PSS_THREAD_ENTRY).cast::<u8>(),
+                size_of::<PSS_THREAD_ENTRY>(),
+            )
+        };
+
+        let result = unsafe {
+            PssWalkSnapshot(
+                snapshot_handle,
+                PSS_WALK_THREADS,
+                marker.0,
+                Some(entry_bytes),
+            )
+        };
+
+        if result == ERROR_NO_MORE_ITEMS_CODE {
+            break;
+        }
+
+        win32_result(result)?;
+
+        let context = if entry.ContextRecord.is_null() {
+            None
+        } else {
+            let context = unsafe { &*entry.ContextRecord };
+            Some(copy_x64_register_context(context))
+        };
+
+        let thread_flags = entry.Flags.0;
+        let terminated = (thread_flags & PSS_THREAD_FLAGS_TERMINATED_VALUE) != 0;
+
+        threads.push(SnapshotThread {
+            process_id: entry.ProcessId,
+            thread_id: entry.ThreadId,
+            teb_base_address: entry.TebBaseAddress as usize,
+            start_address: entry.Win32StartAddress as usize,
+            terminated,
+            thread_flags,
+            exit_status: entry.ExitStatus,
+            suspend_count: entry.SuspendCount,
+            priority: entry.Priority,
+            base_priority: entry.BasePriority,
+            context_size: entry.SizeOfContextRecord,
+            context,
+        });
+    }
+
+    threads.sort_by_key(|thread| thread.thread_id);
+
+    Ok(threads)
+}
+
+pub fn capture_thread_contexts(pid: u32) -> windows::core::Result<SnapshotThreadReport> {
+    let snapshot = capture_va_clone(pid)?;
+    let threads = walk_snapshot_threads(snapshot.snapshot_handle)?;
+
+    Ok(SnapshotThreadReport {
+        source_pid: snapshot.source_pid(),
+        clone_pid: snapshot.clone_pid(),
+        threads,
     })
 }
 
@@ -396,6 +615,95 @@ fn win32_result(code: u32) -> windows::core::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminated_entries_do_not_count_as_missing_live_contexts() {
+        let report = SnapshotThreadReport {
+            source_pid: 1,
+            clone_pid: 2,
+            threads: vec![
+                SnapshotThread {
+                    process_id: 1,
+                    thread_id: 10,
+                    teb_base_address: 0x1000,
+                    start_address: 0x2000,
+                    terminated: false,
+                    thread_flags: 0,
+                    exit_status: STILL_ACTIVE_CODE,
+                    suspend_count: 0,
+                    priority: 8,
+                    base_priority: 8,
+                    context_size: 0,
+                    context: Some(X64RegisterContext {
+                        rax: 0,
+                        rbx: 0,
+                        rcx: 0,
+                        rdx: 0,
+                        rsi: 0,
+                        rdi: 0,
+                        r8: 0,
+                        r9: 0,
+                        r10: 0,
+                        r11: 0,
+                        r12: 0,
+                        r13: 0,
+                        r14: 0,
+                        r15: 0,
+                        rip: 1,
+                        rsp: 2,
+                        rbp: 3,
+                        eflags: 0x202,
+                    }),
+                },
+                SnapshotThread {
+                    process_id: 1,
+                    thread_id: 11,
+                    teb_base_address: 0,
+                    start_address: 0x3000,
+                    terminated: true,
+                    thread_flags: PSS_THREAD_FLAGS_TERMINATED_VALUE,
+                    exit_status: 0,
+                    suspend_count: 0,
+                    priority: 8,
+                    base_priority: 8,
+                    context_size: 0,
+                    context: None,
+                },
+            ],
+        };
+
+        assert_eq!(report.live_threads(), 1);
+        assert_eq!(report.terminated_threads(), 1);
+        assert_eq!(report.live_contexts_captured(), 1);
+        assert_eq!(report.missing_live_contexts(), 0);
+        assert!(report.complete_live_contexts());
+        assert!(report.lifecycle_status_consistent());
+    }
+
+    #[test]
+    fn copies_x64_control_and_integer_registers() {
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+
+        context.Rax = 0x01;
+        context.Rbx = 0x02;
+        context.Rcx = 0x03;
+        context.Rdx = 0x04;
+        context.Rsp = 0x1000;
+        context.Rbp = 0x2000;
+        context.Rip = 0x3000;
+        context.EFlags = 0x202;
+
+        let copied = copy_x64_register_context(&context);
+
+        assert_eq!(copied.rax, 0x01);
+        assert_eq!(copied.rbx, 0x02);
+        assert_eq!(copied.rcx, 0x03);
+        assert_eq!(copied.rdx, 0x04);
+        assert_eq!(copied.rsp, 0x1000);
+        assert_eq!(copied.rbp, 0x2000);
+        assert_eq!(copied.rip, 0x3000);
+        assert_eq!(copied.eflags, 0x202);
+    }
 
     #[test]
     fn recognizes_kuser_shared_data_as_system_volatile() {
