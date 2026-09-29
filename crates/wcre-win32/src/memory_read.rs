@@ -1,13 +1,15 @@
 use std::ffi::c_void;
 
+use windows::Win32::Foundation::HANDLE;
+
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Memory::{
     PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS,
     PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
 };
-use windows::Win32::System::Threading::PROCESS_VM_READ;
+use windows::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 
-use crate::memory::{MemoryState, query_memory_map};
+use crate::memory::{MemoryState, MemoryType, query_memory_map_handle};
 use crate::process::open_process;
 
 const READ_CHUNK_SIZE: usize = 1024 * 1024;
@@ -42,6 +44,30 @@ pub struct MemoryReadReport {
     /// This is intended only as an experimental verification fingerprint.
     /// It is not a security or checkpoint-integrity hash.
     pub fingerprint: u64,
+
+    /// Fingerprints split by VirtualQueryEx memory type.
+    pub private: MemoryTypeReadSummary,
+    pub mapped: MemoryTypeReadSummary,
+    pub image: MemoryTypeReadSummary,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryTypeReadSummary {
+    pub readable_regions: usize,
+    pub readable_bytes: u64,
+    pub bytes_read: u64,
+    pub fingerprint: u64,
+}
+
+impl MemoryTypeReadSummary {
+    fn new() -> Self {
+        Self {
+            readable_regions: 0,
+            readable_bytes: 0,
+            bytes_read: 0,
+            fingerprint: FNV_OFFSET_BASIS,
+        }
+    }
 }
 
 impl MemoryReadReport {
@@ -76,9 +102,15 @@ pub struct MemoryReadFailure {
 /// and individual ReadProcessMemory calls. Those races are recorded rather
 /// than silently ignored.
 pub fn read_process_memory(pid: u32) -> windows::core::Result<MemoryReadReport> {
-    let map = query_memory_map(pid)?;
+    let handle = open_process(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)?;
+    read_process_memory_handle(pid, handle.raw())
+}
 
-    let handle = open_process(pid, PROCESS_VM_READ)?;
+pub(crate) fn read_process_memory_handle(
+    pid: u32,
+    handle: HANDLE,
+) -> windows::core::Result<MemoryReadReport> {
+    let map = query_memory_map_handle(handle)?;
 
     let mut report = MemoryReadReport {
         pid,
@@ -89,6 +121,9 @@ pub fn read_process_memory(pid: u32) -> windows::core::Result<MemoryReadReport> 
         regions_with_failures: 0,
         failures: Vec::new(),
         fingerprint: FNV_OFFSET_BASIS,
+        private: MemoryTypeReadSummary::new(),
+        mapped: MemoryTypeReadSummary::new(),
+        image: MemoryTypeReadSummary::new(),
     };
 
     let mut scratch = vec![0u8; READ_CHUNK_SIZE];
@@ -104,6 +139,21 @@ pub fn read_process_memory(pid: u32) -> windows::core::Result<MemoryReadReport> 
 
         report.readable_regions += 1;
         report.readable_bytes += region.region_size as u64;
+
+        if let Some(summary) = type_summary_mut(&mut report, region.kind) {
+            summary.readable_regions += 1;
+            summary.readable_bytes += region.region_size as u64;
+
+            summary.fingerprint = fnv1a64_update(
+                summary.fingerprint,
+                &(region.base_address as u64).to_le_bytes(),
+            );
+
+            summary.fingerprint = fnv1a64_update(
+                summary.fingerprint,
+                &(region.region_size as u64).to_le_bytes(),
+            );
+        }
 
         report.fingerprint = fnv1a64_update(
             report.fingerprint,
@@ -147,7 +197,7 @@ pub fn read_process_memory(pid: u32) -> windows::core::Result<MemoryReadReport> 
             // - scratch contains at least chunk_size writable bytes.
             let result = unsafe {
                 ReadProcessMemory(
-                    handle.raw(),
+                    handle,
                     address as *const c_void,
                     scratch.as_mut_ptr() as *mut c_void,
                     chunk_size,
@@ -164,6 +214,15 @@ pub fn read_process_memory(pid: u32) -> windows::core::Result<MemoryReadReport> 
                 report.fingerprint = fnv1a64_update(report.fingerprint, &scratch[..observed]);
 
                 report.bytes_read += observed as u64;
+
+                if let Some(summary) = type_summary_mut(&mut report, region.kind) {
+                    summary.fingerprint =
+                        fnv1a64_update(summary.fingerprint, &(address as u64).to_le_bytes());
+
+                    summary.fingerprint = fnv1a64_update(summary.fingerprint, &scratch[..observed]);
+
+                    summary.bytes_read += observed as u64;
+                }
             }
 
             match result {
@@ -207,7 +266,19 @@ pub fn read_process_memory(pid: u32) -> windows::core::Result<MemoryReadReport> 
     Ok(report)
 }
 
-fn is_readable_protection(raw: u32) -> bool {
+fn type_summary_mut(
+    report: &mut MemoryReadReport,
+    kind: MemoryType,
+) -> Option<&mut MemoryTypeReadSummary> {
+    match kind {
+        MemoryType::Private => Some(&mut report.private),
+        MemoryType::Mapped => Some(&mut report.mapped),
+        MemoryType::Image => Some(&mut report.image),
+        MemoryType::None | MemoryType::Unknown(_) => None,
+    }
+}
+
+pub(crate) fn is_readable_protection(raw: u32) -> bool {
     if raw == 0 {
         return false;
     }

@@ -2,6 +2,8 @@ use std::ffi::c_void;
 use std::fmt;
 use std::mem::size_of;
 
+use windows::Win32::Foundation::HANDLE;
+
 use windows::Win32::System::Memory::{
     MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE,
     MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
@@ -145,7 +147,10 @@ impl fmt::Display for MemoryProtection {
 /// Enumerate the observable user-mode virtual address space of a process.
 pub fn query_memory_map(pid: u32) -> windows::core::Result<MemoryMap> {
     let handle = open_process(pid, PROCESS_QUERY_INFORMATION)?;
+    query_memory_map_handle(handle.raw())
+}
 
+pub(crate) fn query_memory_map_handle(handle: HANDLE) -> windows::core::Result<MemoryMap> {
     let mut system_info = SYSTEM_INFO::default();
 
     // SAFETY:
@@ -170,7 +175,7 @@ pub fn query_memory_map(pid: u32) -> windows::core::Result<MemoryMap> {
         // - info is valid writable storage.
         let bytes_returned = unsafe {
             VirtualQueryEx(
-                handle.raw(),
+                handle,
                 Some(address as *const c_void),
                 &mut info,
                 size_of::<MEMORY_BASIC_INFORMATION>(),
