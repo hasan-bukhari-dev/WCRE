@@ -9,14 +9,22 @@
 mod memory;
 mod memory_read;
 mod process;
+mod snapshot;
 
 pub use memory::{
     MemoryMap, MemoryProtection, MemoryRegion, MemoryState, MemoryType, query_memory_map,
 };
 
-pub use memory_read::{MemoryReadFailure, MemoryReadReport, read_process_memory};
+pub use memory_read::{
+    MemoryReadFailure, MemoryReadReport, MemoryTypeReadSummary, read_process_memory,
+};
 
 pub use process::{ProcessArchitecture, ProcessInfo, inspect_process};
+
+pub use snapshot::{
+    SnapshotMemoryComparison, SnapshotPrivateDiff, SnapshotPrivateRegionChange, VaCloneSnapshot,
+    capture_va_clone, compare_va_clone_memory, diff_va_clone_private_memory,
+};
 
 pub const PROJECT_NAME: &str = "WCRE";
 pub const CURRENT_MILESTONE: &str = "M0 - Process State Capture";
