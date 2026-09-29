@@ -7,11 +7,14 @@
 //! No process restoration functionality is implemented yet.
 
 mod memory;
+mod memory_read;
 mod process;
 
 pub use memory::{
     MemoryMap, MemoryProtection, MemoryRegion, MemoryState, MemoryType, query_memory_map,
 };
+
+pub use memory_read::{MemoryReadFailure, MemoryReadReport, read_process_memory};
 
 pub use process::{ProcessArchitecture, ProcessInfo, inspect_process};
 
