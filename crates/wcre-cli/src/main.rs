@@ -1,7 +1,7 @@
 use std::env;
 use std::process::ExitCode;
 
-use wcre_win32::{inspect_process, query_memory_map};
+use wcre_win32::{inspect_process, query_memory_map, read_process_memory};
 
 fn main() -> ExitCode {
     match run() {
@@ -26,6 +26,11 @@ fn run() -> Result<(), String> {
         Some("memory-map") => {
             let pid = parse_pid_arguments(args.collect(), "memory-map")?;
             run_memory_map(pid)
+        }
+
+        Some("memory-read") => {
+            let pid = parse_pid_arguments(args.collect(), "memory-read")?;
+            run_memory_read(pid)
         }
 
         Some("-h") | Some("--help") | None => {
@@ -110,6 +115,55 @@ fn run_memory_map(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
+fn run_memory_read(pid: u32) -> Result<(), String> {
+    let report = read_process_memory(pid)
+        .map_err(|error| format!("failed to read memory for PID {pid}: {error}"))?;
+
+    println!("WCRE Memory Read Probe");
+    println!();
+    println!("{:<24}{}", "PID:", report.pid);
+    println!("{:<24}{}", "Readable regions:", report.readable_regions);
+    println!("{:<24}{}", "Fully read regions:", report.fully_read_regions);
+    println!(
+        "{:<24}{}",
+        "Regions with failures:", report.regions_with_failures
+    );
+    println!(
+        "{:<24}{}",
+        "Readable bytes:",
+        format_size(report.readable_bytes)
+    );
+    println!("{:<24}{}", "Bytes read:", format_size(report.bytes_read));
+    println!("{:<24}{:.4}%", "Coverage:", report.coverage_percent());
+    println!("{:<24}{:016X}", "FNV-1a fingerprint:", report.fingerprint);
+    println!("{:<24}{}", "Failed chunks:", report.failures.len());
+
+    if !report.failures.is_empty() {
+        println!();
+        println!("First failures");
+        println!("--------------");
+
+        for failure in report.failures.iter().take(8) {
+            println!(
+                "{:016X}  requested={} read={}  {}",
+                failure.address,
+                format_size(failure.requested_bytes as u64),
+                format_size(failure.bytes_read as u64),
+                failure.error
+            );
+        }
+    }
+
+    if !report.complete() {
+        return Err(format!(
+            "memory read was incomplete: {:.4}% coverage",
+            report.coverage_percent()
+        ));
+    }
+
+    Ok(())
+}
+
 fn format_size(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = 1024.0 * 1024.0;
@@ -137,4 +191,5 @@ fn print_help() {
     println!("Usage:");
     println!("  wcre-cli inspect --pid <PID>");
     println!("  wcre-cli memory-map --pid <PID>");
+    println!("  wcre-cli memory-read --pid <PID>");
 }
