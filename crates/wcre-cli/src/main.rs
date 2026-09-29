@@ -1,5 +1,66 @@
-﻿fn main() {
+﻿use std::env;
+use std::process::ExitCode;
+
+use wcre_win32::inspect_process;
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), String> {
+    let mut args = env::args().skip(1);
+
+    match args.next().as_deref() {
+        Some("inspect") => run_inspect(args.collect()),
+
+        Some("-h") | Some("--help") | None => {
+            print_help();
+            Ok(())
+        }
+
+        Some(command) => Err(format!(
+            "unknown command '{command}'\n\nRun `wcre-cli --help` for usage."
+        )),
+    }
+}
+
+fn run_inspect(args: Vec<String>) -> Result<(), String> {
+    if args.len() != 2 || args[0] != "--pid" {
+        return Err("usage: wcre-cli inspect --pid <PID>".to_string());
+    }
+
+    let pid = args[1]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid process ID '{}'", args[1]))?;
+
+    let process =
+        inspect_process(pid).map_err(|error| format!("failed to inspect PID {pid}: {error}"))?;
+
+    println!("WCRE Process Inspector");
+    println!();
+    println!("{:<21}{}", "PID:", process.pid);
+    println!("{:<21}{}", "Image:", process.image_path.display());
+    println!("{:<21}{}", "Architecture:", process.architecture);
+    println!(
+        "{:<21}{}",
+        "Native architecture:", process.native_architecture
+    );
+
+    Ok(())
+}
+
+fn print_help() {
     println!("WCRE - Windows Checkpoint/Restore Engine");
     println!("Version: 0.0.1-dev");
     println!("Milestone: M0 - Process State Capture");
+    println!();
+    println!("Usage:");
+    println!("  wcre-cli inspect --pid <PID>");
 }
