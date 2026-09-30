@@ -863,3 +863,232 @@ fn v2_reader_rejects_authenticated_semantically_invalid_body() {
         "unexpected error: {error:?}"
     );
 }
+
+mod property_tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::*;
+
+    const PROPERTY_SEED: u64 = 0x5743_5245_5632_0009;
+
+    #[derive(Clone, Copy)]
+    struct DeterministicRng {
+        state: u64,
+    }
+
+    impl DeterministicRng {
+        fn new(seed: u64) -> Self {
+            assert_ne!(seed, 0);
+            Self { state: seed }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut value = self.state;
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            self.state = value;
+            value
+        }
+
+        fn next_usize(&mut self, upper_exclusive: usize) -> usize {
+            assert_ne!(upper_exclusive, 0);
+            (self.next_u64() % upper_exclusive as u64) as usize
+        }
+
+        fn next_nonzero_u8(&mut self) -> u8 {
+            let value = self.next_u64() as u8;
+            if value == 0 { 1 } else { value }
+        }
+
+        fn fill(&mut self, bytes: &mut [u8]) {
+            for byte in bytes {
+                *byte = self.next_u64() as u8;
+            }
+        }
+    }
+
+    fn decode_without_panic(bytes: &[u8], description: &str) -> Result<CheckpointModel, WcrError> {
+        catch_unwind(AssertUnwindSafe(|| read_checkpoint(Cursor::new(bytes))))
+            .unwrap_or_else(|_| panic!("decoder panicked for {description}"))
+    }
+
+    fn error_class(error: &WcrError) -> &'static str {
+        match error {
+            WcrError::Io(_) => "io",
+            WcrError::InvalidMagic { .. } => "invalid-magic",
+            WcrError::UnsupportedFormatVersion { .. } => "unsupported-format-version",
+            WcrError::UnsupportedModelVersion { .. } => "unsupported-model-version",
+            WcrError::InvalidArchitecture(_) => "invalid-architecture",
+            WcrError::InvalidBoolean(_) => "invalid-boolean",
+            WcrError::InvalidUtf8 => "invalid-utf8",
+            WcrError::InvalidData(_) => "invalid-data",
+            WcrError::AllocationFailed(_) => "allocation-failed",
+            WcrError::IntegrityMismatch => "integrity-mismatch",
+            WcrError::UnsupportedIntegrityAlgorithm(_) => "unsupported-integrity-algorithm",
+            WcrError::InvalidHeaderSize { .. } => "invalid-header-size",
+            WcrError::BodyLengthMismatch { .. } => "body-length-mismatch",
+            WcrError::ValueOutOfRange(_) => "value-out-of-range",
+        }
+    }
+
+    fn assert_same_outcome_class(bytes: &[u8], description: &str) {
+        let first = decode_without_panic(bytes, description);
+        let second = decode_without_panic(bytes, description);
+
+        match (first, second) {
+            (Ok(first), Ok(second)) => assert_eq!(first, second, "{description}"),
+            (Err(first), Err(second)) => assert_eq!(
+                error_class(&first),
+                error_class(&second),
+                "nondeterministic error class for {description}: {first:?} vs {second:?}"
+            ),
+            (first, second) => panic!(
+                "nondeterministic success/error outcome for {description}: \
+                 {first:?} vs {second:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn arbitrary_byte_slices_never_panic() {
+        let mut rng = DeterministicRng::new(PROPERTY_SEED);
+
+        for case in 0..512 {
+            let length = rng.next_usize(2_049);
+            let mut bytes = vec![0u8; length];
+            rng.fill(&mut bytes);
+
+            let _ = decode_without_panic(&bytes, &format!("arbitrary case {case}, len {length}"));
+        }
+    }
+
+    #[test]
+    fn every_truncation_of_valid_v1_and_v2_is_rejected_without_panic() {
+        let checkpoint = sample_checkpoint();
+        let mut v1 = Vec::new();
+        write_checkpoint(&checkpoint, &mut v1).expect("v1 checkpoint should encode");
+        let v2 = sample_v2_bytes();
+
+        for (format, bytes) in [("v1", v1), ("v2", v2)] {
+            for cut in 0..bytes.len() {
+                let outcome = decode_without_panic(
+                    &bytes[..cut],
+                    &format!("{format} truncation at byte {cut}"),
+                );
+
+                assert!(
+                    outcome.is_err(),
+                    "{format} truncation at byte {cut} unexpectedly decoded"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deterministic_v2_byte_mutations_are_rejected_without_panic() {
+        let original = sample_v2_bytes();
+        let mut rng = DeterministicRng::new(PROPERTY_SEED ^ 0x4D55_5441_5445);
+
+        for case in 0..256 {
+            let mut mutated = original.clone();
+            let mutation_count = 1 + rng.next_usize(8);
+
+            for _ in 0..mutation_count {
+                let index = rng.next_usize(mutated.len());
+                mutated[index] ^= rng.next_nonzero_u8();
+            }
+
+            if mutated == original {
+                let index = rng.next_usize(mutated.len());
+                mutated[index] ^= 1;
+            }
+
+            let outcome = decode_without_panic(&mutated, &format!("v2 mutation case {case}"));
+
+            assert!(
+                outcome.is_err(),
+                "v2 mutation case {case} unexpectedly decoded"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_counts_and_lengths_above_limits_are_rejected() {
+        for count in [crate::format::MAX_COLLECTION_ITEMS + 1, u32::MAX] {
+            let mut bytes = sample_v2_bytes();
+            bytes[28..32].copy_from_slice(&count.to_le_bytes());
+            resign_v2(&mut bytes);
+
+            let error = decode_without_panic(&bytes, &format!("image count {count}"))
+                .expect_err("oversized image count must fail");
+            assert!(matches!(error, WcrError::InvalidData(_)));
+        }
+
+        for length in [crate::format::MAX_STRING_BYTES + 1, u32::MAX] {
+            let mut bytes = sample_v2_bytes();
+            let body_start = crate::format::WCR_V2_HEADER_SIZE as usize;
+            let digest_start = bytes.len() - crate::format::WCR_V2_DIGEST_SIZE;
+            let image_path = sample_checkpoint().process.image_path;
+            let path_start = body_start
+                + find_nth_bytes(&bytes[body_start..digest_start], image_path.as_bytes(), 0);
+
+            bytes[path_start - 4..path_start].copy_from_slice(&length.to_le_bytes());
+            resign_v2(&mut bytes);
+
+            let error = decode_without_panic(&bytes, &format!("string length {length}"))
+                .expect_err("oversized string length must fail");
+            assert!(matches!(error, WcrError::InvalidData(_)));
+        }
+
+        for length in [crate::format::MAX_SINGLE_PAYLOAD_BYTES + 1, u64::MAX] {
+            let mut bytes = sample_v2_bytes();
+            let body_start = crate::format::WCR_V2_HEADER_SIZE as usize;
+            let digest_start = bytes.len() - crate::format::WCR_V2_DIGEST_SIZE;
+            let payload = [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
+            let payload_start =
+                body_start + find_nth_bytes(&bytes[body_start..digest_start], &payload, 0);
+
+            bytes[payload_start - 8..payload_start].copy_from_slice(&length.to_le_bytes());
+            resign_v2(&mut bytes);
+
+            let error = decode_without_panic(&bytes, &format!("payload length {length}"))
+                .expect_err("oversized payload length must fail");
+            assert!(matches!(error, WcrError::InvalidData(_)));
+        }
+    }
+
+    #[test]
+    fn repeated_decode_has_deterministic_result_or_error_class() {
+        let checkpoint = sample_checkpoint();
+        let mut valid_v1 = Vec::new();
+        write_checkpoint(&checkpoint, &mut valid_v1).expect("v1 checkpoint should encode");
+        let valid_v2 = sample_v2_bytes();
+        let mut corpus = vec![
+            Vec::new(),
+            vec![0],
+            crate::format::WCR_MAGIC.to_vec(),
+            valid_v1,
+            valid_v2.clone(),
+        ];
+        let mut rng = DeterministicRng::new(PROPERTY_SEED ^ 0x4445_5445_524D);
+
+        for _ in 0..64 {
+            let length = rng.next_usize(513);
+            let mut bytes = vec![0u8; length];
+            rng.fill(&mut bytes);
+            corpus.push(bytes);
+        }
+
+        for _ in 0..32 {
+            let mut bytes = valid_v2.clone();
+            let index = rng.next_usize(bytes.len());
+            bytes[index] ^= rng.next_nonzero_u8();
+            corpus.push(bytes);
+        }
+
+        for (case, bytes) in corpus.iter().enumerate() {
+            assert_same_outcome_class(bytes, &format!("determinism corpus case {case}"));
+        }
+    }
+}
