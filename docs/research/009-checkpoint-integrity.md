@@ -2,7 +2,7 @@
 
 ## Status
 
-**PASS — WCRE now has a backward-compatible, integrity-protected `.wcr` v2 format, a verified dual-version reader, deterministic parser-hardening coverage, a permanent v1 compatibility fixture, and atomic checkpoint publication.**
+**PASS — WCRE now has a backward-compatible, integrity-protected `.wcr` v2 default, a verified dual-version reader, deterministic parser-hardening coverage, a permanent v1 compatibility fixture, and atomic checkpoint publication.**
 
 This result establishes a substantially stronger persistence boundary. It does not establish process restoration or execution resumption.
 
@@ -26,14 +26,32 @@ WCRE currently supports both persistent formats:
 
 | Format | Reader | Writer | Integrity trailer | Compatibility role |
 |---|---|---|---|---|
-| v1 | Supported | Supported | None | Established wire format and permanent compatibility anchor |
-| v2 | Supported | Explicit opt-in | SHA-256 | Integrity-protected transition format |
+| v1 | Supported | Explicit opt-in | None | Established wire format and permanent compatibility anchor |
+| v2 | Supported | Default and explicit | SHA-256 | Integrity-protected current format |
 
-At this evidence point, the public library writer and CLI still default to v1 while the final default-format decision is evaluated separately. Callers can select v2 explicitly.
+The public library writer and CLI default to v2. Callers can still select either version explicitly.
 
 The in-memory `CheckpointModel` version remains independent of the persistent `.wcr` format version.
 
 No v1 field, encoding, ordering rule, or byte sequence was silently changed.
+
+### Default-format decision
+
+v2 became the default only after all of the following were in place:
+
+- streaming v2 encoding,
+- integrity verification before body deserialization,
+- dual-version reader dispatch,
+- authenticated malformed-input coverage,
+- deterministic property-style parser tests,
+- a byte-exact golden v1 fixture,
+- successful live v2 creation and post-mortem inspection,
+- demonstrated corruption rejection,
+- atomic final-file publication.
+
+The transition is an API default change, not a v1 wire-format change. The explicit `write_checkpoint_v1` and `write_checkpoint_v1_file` APIs preserve intentional v1 output. `write_checkpoint_v2` and `write_checkpoint_v2_file` remain available when explicitness is useful, while `write_checkpoint` and `write_checkpoint_file` now select v2.
+
+This makes new checkpoints integrity-protected by default without weakening old-checkpoint readability or byte-for-byte v1 reproducibility.
 
 ---
 
@@ -255,11 +273,18 @@ The checkpoint command accepts an explicit format:
 wcre-cli checkpoint --pid <PID> --output <FILE.wcr> [--format <v1|v2>]
 ```
 
-At this evidence point, omission selects v1. Explicit examples are:
+Omission selects v2. Explicit examples are:
 
 ```text
 wcre-cli checkpoint --pid 1234 --output checkpoint-v1.wcr --format v1
 wcre-cli checkpoint --pid 1234 --output checkpoint-v2.wcr --format v2
+```
+
+The following two commands therefore both create v2 checkpoints:
+
+```text
+wcre-cli checkpoint --pid 1234 --output checkpoint-default.wcr
+wcre-cli checkpoint --pid 1234 --output checkpoint-explicit-v2.wcr --format v2
 ```
 
 The inspector auto-detects both versions:
@@ -325,13 +350,13 @@ This demonstrates live CLI creation, independent post-mortem inspection, and cor
 
 ## Validation Evidence
 
-At the end of the atomic-publication slice:
+At the end of Feature #9, including the v2-default transition:
 
 ```text
 cargo fmt --all -- --check    PASS
 cargo check --workspace       PASS
-cargo test -p wcre-image      59 passed, 0 failed
-cargo test --workspace        85 passed, 0 failed
+cargo test -p wcre-image      61 passed, 0 failed
+cargo test --workspace        87 passed, 0 failed
 git diff --check              PASS
 ```
 
@@ -339,10 +364,10 @@ Workspace test distribution:
 
 | Component | Passing tests |
 |---|---:|
-| `wcre-image` | 59 |
+| `wcre-image` | 61 |
 | `wcre-cli` | 5 |
 | `wcre-win32` | 21 |
-| Total | 85 |
+| Total | 87 |
 
 ---
 
@@ -403,10 +428,10 @@ The current proof is checkpoint capture, durable publication, integrity validati
 
 ---
 
-## Result and Transition Gate
+## Result
 
 **PASS — checkpoint persistence hardening validated.**
 
-The evidence supports a final, explicit decision about whether v2 should become the default writer format. That decision must preserve an explicit v1 writer, the golden v1 bytes, and dual-reader compatibility.
+The evidence supported making v2 the default writer format while preserving an explicit v1 writer, the golden v1 bytes, and dual-reader compatibility.
 
-Only after that decision and a final clean validation run should Feature #9 close. The next architectural experiment is exact virtual-address reconstruction, but it is not part of this research slice.
+The final clean validation run passed, so Feature #9 can close. The next architectural experiment is exact virtual-address reconstruction, but it is not part of this research slice.

@@ -9,11 +9,8 @@ pub const WCR_FORMAT_VERSION_V1: u32 = 1;
 /// Integrity-protected `.wcr` format.
 pub const WCR_FORMAT_VERSION_V2: u32 = 2;
 
-/// Current format emitted by the eventual default writer.
-///
-/// Feature #9 introduces v2 alongside v1 first. The public default writer
-/// remains v1 until v2 compatibility tests are complete.
-pub const WCR_FORMAT_VERSION: u32 = WCR_FORMAT_VERSION_V1;
+/// Current format emitted by the default writer.
+pub const WCR_FORMAT_VERSION: u32 = WCR_FORMAT_VERSION_V2;
 
 /// Fixed v2 header size in bytes.
 ///
@@ -62,7 +59,7 @@ pub const MEMORY_KIND_IMAGE: u32 = 3;
 pub const MEMORY_KIND_NONE: u32 = 4;
 pub const MEMORY_KIND_UNKNOWN: u32 = 0xFFFF_FFFF;
 
-/// Defensive limits for the v1 decoder.
+/// Defensive limits for the v1 and v2 decoders.
 ///
 /// These are format-parser safety limits, not statements about the final
 /// supported WCRE workload envelope.
@@ -70,7 +67,7 @@ pub const MAX_COLLECTION_ITEMS: u32 = 1_000_000;
 pub const MAX_STRING_BYTES: u32 = 16 * 1024 * 1024;
 pub const MAX_SINGLE_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Maximum cumulative payload bytes accepted by the v1 decoder.
+/// Maximum cumulative payload bytes accepted by the v1 and v2 decoders.
 ///
 /// This is a parser-safety budget rather than a statement about the
 /// eventual WCRE workload or migration envelope.

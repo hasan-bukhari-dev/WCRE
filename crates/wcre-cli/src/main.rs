@@ -1,7 +1,7 @@
 use std::env;
 use std::process::ExitCode;
 
-use wcre_image::{read_checkpoint_file, write_checkpoint_file, write_checkpoint_v2_file};
+use wcre_image::{read_checkpoint_file, write_checkpoint_v1_file, write_checkpoint_v2_file};
 
 use wcre_win32::{
     MemoryTypeReadSummary, capture_checkpoint_model, capture_image_inventory,
@@ -315,7 +315,7 @@ fn parse_checkpoint_arguments(
     let pid = pid.ok_or_else(|| "missing required --pid argument".to_string())?;
 
     let output = output.ok_or_else(|| "missing required --output argument".to_string())?;
-    let format = format.unwrap_or(CheckpointFormat::V1);
+    let format = format.unwrap_or(CheckpointFormat::V2);
 
     Ok((pid, output, format))
 }
@@ -383,7 +383,7 @@ fn run_checkpoint(pid: u32, output: &str, format: CheckpointFormat) -> Result<()
     }
 
     match format {
-        CheckpointFormat::V1 => write_checkpoint_file(&checkpoint, output),
+        CheckpointFormat::V1 => write_checkpoint_v1_file(&checkpoint, output),
         CheckpointFormat::V2 => write_checkpoint_v2_file(&checkpoint, output),
     }
     .map_err(|error| {
@@ -1393,14 +1393,14 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_arguments_default_to_v1() {
+    fn checkpoint_arguments_default_to_v2() {
         let (pid, output, format) =
             parse_checkpoint_arguments(strings(&["--pid", "4242", "--output", "checkpoint.wcr"]))
                 .expect("default checkpoint arguments should parse");
 
         assert_eq!(pid, 4242);
         assert_eq!(output, "checkpoint.wcr");
-        assert_eq!(format, CheckpointFormat::V1);
+        assert_eq!(format, CheckpointFormat::V2);
     }
 
     #[test]

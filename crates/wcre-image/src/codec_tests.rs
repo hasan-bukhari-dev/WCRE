@@ -6,7 +6,7 @@ use tempfile::tempdir;
 use crate::{
     Architecture, CheckpointModel, ImageRecord, MemoryKind, MemoryPayload, MemoryProtection,
     MemoryRegionRecord, MemoryState, ProcessRecord, ThreadRecord, WcrError, X64ContextSubset,
-    read_checkpoint, write_checkpoint,
+    read_checkpoint, write_checkpoint, write_checkpoint_v1,
 };
 
 fn sample_checkpoint() -> CheckpointModel {
@@ -145,7 +145,7 @@ fn checkpoint_round_trips_through_wcr_v1() {
 
     let mut bytes = Vec::new();
 
-    write_checkpoint(&original, &mut bytes).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&original, &mut bytes).expect("sample checkpoint should encode");
 
     let decoded = read_checkpoint(Cursor::new(bytes)).expect("encoded checkpoint should decode");
 
@@ -157,7 +157,7 @@ fn v1_writer_matches_golden_fixture_exactly() {
     let checkpoint = sample_checkpoint();
     let mut encoded = Vec::new();
 
-    write_checkpoint(&checkpoint, &mut encoded).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&checkpoint, &mut encoded).expect("sample checkpoint should encode");
 
     assert_eq!(encoded, golden_v1_bytes());
 }
@@ -171,12 +171,31 @@ fn golden_v1_fixture_decodes_to_expected_checkpoint() {
 }
 
 #[test]
+fn default_writer_emits_verified_v2() {
+    let checkpoint = sample_checkpoint();
+    let mut bytes = Vec::new();
+
+    write_checkpoint(&checkpoint, &mut bytes).expect("default checkpoint should encode");
+
+    let format_version = u32::from_le_bytes(bytes[8..12].try_into().expect("format version"));
+    let decoded = read_checkpoint(Cursor::new(bytes)).expect("default checkpoint should decode");
+
+    assert_eq!(format_version, crate::format::WCR_FORMAT_VERSION_V2);
+    assert_eq!(
+        crate::format::WCR_FORMAT_VERSION,
+        crate::format::WCR_FORMAT_VERSION_V2
+    );
+    assert_eq!(decoded, checkpoint);
+}
+
+#[test]
 fn atomic_v1_file_publication_succeeds_and_decodes() {
     let directory = tempdir().expect("temporary directory should be created");
     let path = directory.path().join("checkpoint-v1.wcr");
     let checkpoint = sample_checkpoint();
 
-    crate::write_checkpoint_file(&checkpoint, &path).expect("atomic v1 publication should succeed");
+    crate::write_checkpoint_v1_file(&checkpoint, &path)
+        .expect("atomic v1 publication should succeed");
 
     let bytes = fs::read(&path).expect("published v1 checkpoint should be readable");
     let format_version = u32::from_le_bytes(bytes[8..12].try_into().expect("format version"));
@@ -200,6 +219,24 @@ fn atomic_v2_file_publication_succeeds_and_decodes() {
     let format_version = u32::from_le_bytes(bytes[8..12].try_into().expect("format version"));
     let decoded =
         crate::read_checkpoint_file(&path).expect("published v2 checkpoint should decode");
+
+    assert_eq!(format_version, crate::format::WCR_FORMAT_VERSION_V2);
+    assert_eq!(decoded, checkpoint);
+}
+
+#[test]
+fn default_file_writer_atomically_publishes_v2() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("checkpoint-default.wcr");
+    let checkpoint = sample_checkpoint();
+
+    crate::write_checkpoint_file(&checkpoint, &path)
+        .expect("default atomic publication should succeed");
+
+    let bytes = fs::read(&path).expect("published default checkpoint should be readable");
+    let format_version = u32::from_le_bytes(bytes[8..12].try_into().expect("format version"));
+    let decoded =
+        crate::read_checkpoint_file(&path).expect("published default checkpoint should decode");
 
     assert_eq!(format_version, crate::format::WCR_FORMAT_VERSION_V2);
     assert_eq!(decoded, checkpoint);
@@ -300,7 +337,7 @@ fn checkpoint_round_trip_preserves_model_owned_memory() {
 
     let mut bytes = Vec::new();
 
-    write_checkpoint(&original, &mut bytes).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&original, &mut bytes).expect("sample checkpoint should encode");
 
     let decoded = read_checkpoint(Cursor::new(bytes)).expect("encoded checkpoint should decode");
 
@@ -316,7 +353,7 @@ fn decoder_rejects_invalid_magic() {
 
     let mut bytes = Vec::new();
 
-    write_checkpoint(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
 
     bytes[0] ^= 0xFF;
 
@@ -331,7 +368,7 @@ fn decoder_rejects_unsupported_format_version() {
 
     let mut bytes = Vec::new();
 
-    write_checkpoint(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
 
     // Header bytes 8..12 contain WCR_FORMAT_VERSION.
     bytes[8..12].copy_from_slice(&999u32.to_le_bytes());
@@ -351,7 +388,7 @@ fn decoder_rejects_truncated_checkpoint() {
 
     let mut bytes = Vec::new();
 
-    write_checkpoint(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
 
     bytes.truncate(bytes.len() - 3);
 
@@ -367,7 +404,7 @@ fn unknown_architecture_round_trips_losslessly() {
 
     let mut bytes = Vec::new();
 
-    write_checkpoint(&original, &mut bytes).expect("unknown architecture should encode");
+    write_checkpoint_v1(&original, &mut bytes).expect("unknown architecture should encode");
 
     let decoded = read_checkpoint(Cursor::new(bytes)).expect("unknown architecture should decode");
 
@@ -381,7 +418,7 @@ fn decoder_rejects_trailing_garbage() {
 
     let mut bytes = Vec::new();
 
-    write_checkpoint(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
 
     bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
 
@@ -395,7 +432,7 @@ fn decoder_rejects_nonzero_v1_flags() {
     let checkpoint = sample_checkpoint();
     let mut bytes = Vec::new();
 
-    write_checkpoint(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
 
     // Header bytes 20..24 contain v1 flags.
     bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
@@ -410,7 +447,7 @@ fn decoder_rejects_collection_count_over_limit() {
     let checkpoint = sample_checkpoint();
     let mut bytes = Vec::new();
 
-    write_checkpoint(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
 
     // Header bytes 24..28 contain image_count.
     bytes[24..28].copy_from_slice(&1_000_001u32.to_le_bytes());
@@ -426,7 +463,7 @@ fn decoder_rejects_string_length_over_limit() {
     let checkpoint = sample_checkpoint();
     let mut bytes = Vec::new();
 
-    write_checkpoint(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
 
     // Header is 40 bytes, followed by captured_pid (4 bytes), then path length.
     bytes[44..48].copy_from_slice(&(16u32 * 1024 * 1024 + 1).to_le_bytes());
@@ -441,7 +478,7 @@ fn decoder_rejects_zero_sized_memory_region() {
     let checkpoint = sample_checkpoint();
     let mut bytes = Vec::new();
 
-    write_checkpoint(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
 
     let region_base = find_u64(&bytes, 0x0000_0000_1000_0000, 0);
 
@@ -479,7 +516,7 @@ fn decoder_rejects_overflowing_memory_region_range() {
     let checkpoint = sample_checkpoint();
     let mut bytes = Vec::new();
 
-    write_checkpoint(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
 
     let original_base = 0x0000_0000_1000_0000u64;
     let bad_base = u64::MAX - 3;
@@ -509,7 +546,7 @@ fn decoder_rejects_thread_pid_mismatch() {
     let checkpoint = sample_checkpoint();
     let mut bytes = Vec::new();
 
-    write_checkpoint(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
 
     // PID 4242 occurs first in ProcessRecord and again in ThreadRecord.
     let thread_pid_offset = find_u32(&bytes, 4242, 1);
@@ -529,7 +566,7 @@ fn decoder_rejects_inverted_thread_stack_bounds() {
     let checkpoint = sample_checkpoint();
     let mut bytes = Vec::new();
 
-    write_checkpoint(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
 
     let original_stack_base = 0x0000_0000_7100_0000u64;
     let original_stack_limit = 0x0000_0000_70FF_0000u64;
@@ -555,7 +592,7 @@ fn decoder_rejects_rsp_outside_captured_stack() {
     let checkpoint = sample_checkpoint();
     let mut bytes = Vec::new();
 
-    write_checkpoint(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
+    write_checkpoint_v1(&checkpoint, &mut bytes).expect("sample checkpoint should encode");
 
     let original_rsp = 0x0000_0000_70FF_F000u64;
     let rsp_offset = find_u64(&bytes, original_rsp, 0);
@@ -579,7 +616,7 @@ fn encoder_rejects_thread_pid_mismatch() {
     let mut bytes = Vec::new();
 
     let error =
-        write_checkpoint(&checkpoint, &mut bytes).expect_err("thread PID mismatch must fail");
+        write_checkpoint_v1(&checkpoint, &mut bytes).expect_err("thread PID mismatch must fail");
 
     assert!(matches!(error, WcrError::InvalidData(_)));
     assert!(bytes.is_empty());
@@ -594,7 +631,8 @@ fn encoder_rejects_zero_sized_memory_region() {
 
     let mut bytes = Vec::new();
 
-    let error = write_checkpoint(&checkpoint, &mut bytes).expect_err("zero-sized region must fail");
+    let error =
+        write_checkpoint_v1(&checkpoint, &mut bytes).expect_err("zero-sized region must fail");
 
     assert!(matches!(error, WcrError::InvalidData(_)));
     assert!(bytes.is_empty());
@@ -612,7 +650,8 @@ fn encoder_rejects_rsp_outside_captured_stack() {
 
     let mut bytes = Vec::new();
 
-    let error = write_checkpoint(&checkpoint, &mut bytes).expect_err("RSP outside stack must fail");
+    let error =
+        write_checkpoint_v1(&checkpoint, &mut bytes).expect_err("RSP outside stack must fail");
 
     assert!(matches!(error, WcrError::InvalidData(_)));
     assert!(bytes.is_empty());
@@ -797,7 +836,7 @@ fn dual_reader_still_accepts_v1_checkpoint() {
     let checkpoint = sample_checkpoint();
     let mut bytes = Vec::new();
 
-    write_checkpoint(&checkpoint, &mut bytes).expect("v1 checkpoint should encode");
+    write_checkpoint_v1(&checkpoint, &mut bytes).expect("v1 checkpoint should encode");
 
     let decoded =
         read_checkpoint(Cursor::new(bytes)).expect("v1 checkpoint should remain readable");
@@ -1119,7 +1158,7 @@ mod property_tests {
     fn every_truncation_of_valid_v1_and_v2_is_rejected_without_panic() {
         let checkpoint = sample_checkpoint();
         let mut v1 = Vec::new();
-        write_checkpoint(&checkpoint, &mut v1).expect("v1 checkpoint should encode");
+        write_checkpoint_v1(&checkpoint, &mut v1).expect("v1 checkpoint should encode");
         let v2 = sample_v2_bytes();
 
         for (format, bytes) in [("v1", v1), ("v2", v2)] {
@@ -1214,7 +1253,7 @@ mod property_tests {
     fn repeated_decode_has_deterministic_result_or_error_class() {
         let checkpoint = sample_checkpoint();
         let mut valid_v1 = Vec::new();
-        write_checkpoint(&checkpoint, &mut valid_v1).expect("v1 checkpoint should encode");
+        write_checkpoint_v1(&checkpoint, &mut valid_v1).expect("v1 checkpoint should encode");
         let valid_v2 = sample_v2_bytes();
         let mut corpus = vec![
             Vec::new(),

@@ -20,7 +20,8 @@ mod integrity;
 
 pub use decode::{read_checkpoint, read_checkpoint_file};
 pub use encode::{
-    write_checkpoint, write_checkpoint_file, write_checkpoint_v2, write_checkpoint_v2_file,
+    write_checkpoint, write_checkpoint_file, write_checkpoint_v1, write_checkpoint_v1_file,
+    write_checkpoint_v2, write_checkpoint_v2_file,
 };
 pub use error::WcrError;
 

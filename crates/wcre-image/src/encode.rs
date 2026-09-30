@@ -7,7 +7,7 @@ use crate::format::{
     ARCH_ARM32, ARCH_ARM64, ARCH_IA64, ARCH_UNKNOWN_FLAG, ARCH_X64, ARCH_X86, MEMORY_KIND_IMAGE,
     MEMORY_KIND_MAPPED, MEMORY_KIND_NONE, MEMORY_KIND_PRIVATE, MEMORY_KIND_UNKNOWN,
     MEMORY_STATE_COMMIT, MEMORY_STATE_FREE, MEMORY_STATE_RESERVE, MEMORY_STATE_UNKNOWN,
-    WCR_FLAGS_NONE, WCR_FORMAT_VERSION, WCR_FORMAT_VERSION_V2, WCR_INTEGRITY_SHA256, WCR_MAGIC,
+    WCR_FLAGS_NONE, WCR_FORMAT_VERSION_V1, WCR_FORMAT_VERSION_V2, WCR_INTEGRITY_SHA256, WCR_MAGIC,
     WCR_V2_HEADER_SIZE,
 };
 use crate::integrity::Sha256State;
@@ -23,22 +23,24 @@ struct RecordCounts {
 
 #[derive(Debug, Clone, Copy)]
 enum CheckpointFileEncoding {
-    Default,
+    V1,
     V2,
 }
 
-/// Write the current default `.wcr` format.
-///
-/// During the Feature #9 transition this deliberately remains v1 until the
-/// v2 reader and compatibility tests are complete.
-pub fn write_checkpoint<W: Write>(
+/// Write the current default `.wcr` format (v2).
+pub fn write_checkpoint<W: Write>(checkpoint: &CheckpointModel, writer: W) -> Result<(), WcrError> {
+    write_checkpoint_v2(checkpoint, writer)
+}
+
+/// Write a backward-compatible `.wcr` v1 checkpoint.
+pub fn write_checkpoint_v1<W: Write>(
     checkpoint: &CheckpointModel,
     mut writer: W,
 ) -> Result<(), WcrError> {
     let counts = validate_checkpoint_for_encoding(checkpoint)?;
 
     writer.write_all(&WCR_MAGIC)?;
-    write_u32(&mut writer, WCR_FORMAT_VERSION)?;
+    write_u32(&mut writer, WCR_FORMAT_VERSION_V1)?;
     write_u32(&mut writer, checkpoint.model_version)?;
     write_u32(
         &mut writer,
@@ -114,7 +116,14 @@ pub fn write_checkpoint_file(
     checkpoint: &CheckpointModel,
     path: impl AsRef<Path>,
 ) -> Result<(), WcrError> {
-    write_checkpoint_file_atomic(checkpoint, path.as_ref(), CheckpointFileEncoding::Default)
+    write_checkpoint_file_atomic(checkpoint, path.as_ref(), CheckpointFileEncoding::V2)
+}
+
+pub fn write_checkpoint_v1_file(
+    checkpoint: &CheckpointModel,
+    path: impl AsRef<Path>,
+) -> Result<(), WcrError> {
+    write_checkpoint_file_atomic(checkpoint, path.as_ref(), CheckpointFileEncoding::V1)
 }
 
 pub fn write_checkpoint_v2_file(
@@ -139,7 +148,7 @@ fn write_checkpoint_file_atomic(
         let mut writer = BufWriter::new(temporary.as_file_mut());
 
         match encoding {
-            CheckpointFileEncoding::Default => write_checkpoint(checkpoint, &mut writer)?,
+            CheckpointFileEncoding::V1 => write_checkpoint_v1(checkpoint, &mut writer)?,
             CheckpointFileEncoding::V2 => write_checkpoint_v2(checkpoint, &mut writer)?,
         }
 
