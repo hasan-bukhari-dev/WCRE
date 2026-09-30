@@ -489,3 +489,139 @@ fn v2_digest_changes_when_hashed_bytes_are_modified() {
 
     assert_ne!(stored_digest.as_slice(), corrupted_digest.as_slice());
 }
+
+#[test]
+fn v2_checkpoint_round_trips_through_verified_reader() {
+    let checkpoint = sample_checkpoint();
+    let mut bytes = Vec::new();
+
+    crate::write_checkpoint_v2(&checkpoint, &mut bytes).expect("v2 checkpoint should encode");
+
+    let decoded = read_checkpoint(Cursor::new(bytes)).expect("valid v2 checkpoint should decode");
+
+    assert_eq!(decoded, checkpoint);
+}
+
+#[test]
+fn v2_reader_rejects_corrupted_header_byte() {
+    let checkpoint = sample_checkpoint();
+    let mut bytes = Vec::new();
+
+    crate::write_checkpoint_v2(&checkpoint, &mut bytes).expect("v2 checkpoint should encode");
+
+    // Architecture occupies bytes 20..24 in the v2 header.
+    bytes[20] ^= 0x01;
+
+    let error = read_checkpoint(Cursor::new(bytes)).expect_err("corrupted v2 header must fail");
+
+    assert!(
+        matches!(error, WcrError::IntegrityMismatch),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_corrupted_body_byte() {
+    let checkpoint = sample_checkpoint();
+    let mut bytes = Vec::new();
+
+    crate::write_checkpoint_v2(&checkpoint, &mut bytes).expect("v2 checkpoint should encode");
+
+    let body_start = crate::format::WCR_V2_HEADER_SIZE as usize;
+    bytes[body_start] ^= 0x01;
+
+    let error = read_checkpoint(Cursor::new(bytes)).expect_err("corrupted v2 body must fail");
+
+    assert!(
+        matches!(error, WcrError::IntegrityMismatch),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_corrupted_digest() {
+    let checkpoint = sample_checkpoint();
+    let mut bytes = Vec::new();
+
+    crate::write_checkpoint_v2(&checkpoint, &mut bytes).expect("v2 checkpoint should encode");
+
+    let digest_start = bytes.len() - crate::format::WCR_V2_DIGEST_SIZE;
+    bytes[digest_start] ^= 0x01;
+
+    let error = read_checkpoint(Cursor::new(bytes)).expect_err("corrupted v2 digest must fail");
+
+    assert!(
+        matches!(error, WcrError::IntegrityMismatch),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_truncated_digest() {
+    let checkpoint = sample_checkpoint();
+    let mut bytes = Vec::new();
+
+    crate::write_checkpoint_v2(&checkpoint, &mut bytes).expect("v2 checkpoint should encode");
+    bytes.pop();
+
+    let error = read_checkpoint(Cursor::new(bytes)).expect_err("truncated v2 digest must fail");
+
+    assert!(
+        matches!(error, WcrError::Io(_)),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_invalid_header_size() {
+    let checkpoint = sample_checkpoint();
+    let mut bytes = Vec::new();
+
+    crate::write_checkpoint_v2(&checkpoint, &mut bytes).expect("v2 checkpoint should encode");
+    bytes[12..16].copy_from_slice(&60u32.to_le_bytes());
+
+    let error = read_checkpoint(Cursor::new(bytes)).expect_err("wrong v2 header size must fail");
+
+    assert!(
+        matches!(
+            error,
+            WcrError::InvalidHeaderSize {
+                observed: 60,
+                expected: 56
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_unsupported_integrity_algorithm() {
+    let checkpoint = sample_checkpoint();
+    let mut bytes = Vec::new();
+
+    crate::write_checkpoint_v2(&checkpoint, &mut bytes).expect("v2 checkpoint should encode");
+
+    // Integrity algorithm occupies bytes 52..56.
+    bytes[52..56].copy_from_slice(&999u32.to_le_bytes());
+
+    let error =
+        read_checkpoint(Cursor::new(bytes)).expect_err("unsupported integrity algorithm must fail");
+
+    assert!(
+        matches!(error, WcrError::UnsupportedIntegrityAlgorithm(999)),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn dual_reader_still_accepts_v1_checkpoint() {
+    let checkpoint = sample_checkpoint();
+    let mut bytes = Vec::new();
+
+    write_checkpoint(&checkpoint, &mut bytes).expect("v1 checkpoint should encode");
+
+    let decoded =
+        read_checkpoint(Cursor::new(bytes)).expect("v1 checkpoint should remain readable");
+
+    assert_eq!(decoded, checkpoint);
+}
