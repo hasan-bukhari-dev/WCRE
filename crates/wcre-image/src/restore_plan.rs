@@ -355,6 +355,14 @@ fn validate_region_shapes(regions: &[MemoryRegionRecord]) -> Result<(), AddressS
             });
         }
 
+        // Windows' fixed shared-user-data mapping can report an allocation
+        // base that is only page-aligned. It is always deferred below and is
+        // never passed to VirtualAllocEx, so private-reservation granularity
+        // validation does not apply to it.
+        if is_shared_system_region(region) {
+            continue;
+        }
+
         if region.allocation_base % WINDOWS_X64_ALLOCATION_GRANULARITY != 0 {
             return Err(AddressSpacePlanError::MisalignedAllocationBase {
                 allocation_base: region.allocation_base,
@@ -404,12 +412,7 @@ fn classify_deferred_group(
     group: &[&MemoryRegionRecord],
     teb_addresses: &[u64],
 ) -> Option<SkipReason> {
-    if ranges_overlap(
-        allocation_base,
-        allocation_end,
-        KUSER_SHARED_DATA_BASE,
-        KUSER_SHARED_DATA_BASE + KUSER_SHARED_DATA_SIZE,
-    ) {
+    if group.iter().any(|region| is_shared_system_region(region)) {
         return Some(SkipReason::SharedSystemMappingDeferred);
     }
 
@@ -459,6 +462,17 @@ fn classify_deferred_group(
 
 fn ranges_overlap(first_start: u64, first_end: u64, second_start: u64, second_end: u64) -> bool {
     first_start < second_end && second_start < first_end
+}
+
+fn is_shared_system_region(region: &MemoryRegionRecord) -> bool {
+    let end = region.base_address + region.region_size;
+
+    ranges_overlap(
+        region.base_address,
+        end,
+        KUSER_SHARED_DATA_BASE,
+        KUSER_SHARED_DATA_BASE + KUSER_SHARED_DATA_SIZE,
+    )
 }
 
 #[cfg(test)]
@@ -696,6 +710,26 @@ mod tests {
         assert_eq!(
             plan.skipped[0].reason,
             SkipReason::ThreadEnvironmentBlockDeferred
+        );
+    }
+
+    #[test]
+    fn shared_user_data_allows_observed_page_aligned_allocation_base() {
+        let checkpoint = checkpoint(vec![region(
+            KUSER_SHARED_DATA_BASE,
+            0x0000_0000_7FFE_A000,
+            WINDOWS_X64_PAGE_SIZE,
+            MemoryState::Commit,
+            MemoryKind::Mapped,
+        )]);
+
+        let plan = plan_address_space(&checkpoint)
+            .expect("fixed shared user data should be deferred before granularity validation");
+
+        assert!(plan.operations.is_empty());
+        assert_eq!(
+            plan.skipped[0].reason,
+            SkipReason::SharedSystemMappingDeferred
         );
     }
 }

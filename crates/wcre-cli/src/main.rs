@@ -1,13 +1,18 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::process::ExitCode;
 
-use wcre_image::{read_checkpoint_file, write_checkpoint_v1_file, write_checkpoint_v2_file};
+use wcre_image::{
+    AddressSpaceOperation, SkipReason, plan_address_space, read_checkpoint_file,
+    write_checkpoint_v1_file, write_checkpoint_v2_file,
+};
 
 use wcre_win32::{
-    MemoryTypeReadSummary, capture_checkpoint_model, capture_image_inventory,
+    ExactAddressSpaceSession, ExactAllocationError, MemoryState as Win32MemoryState,
+    MemoryTypeReadSummary, ProcessArchitecture, capture_checkpoint_model, capture_image_inventory,
     capture_snapshot_probe, capture_thread_contexts, capture_thread_state_validation,
     capture_va_clone, compare_va_clone_memory, diff_va_clone_private_memory, inspect_process,
-    query_memory_map, read_process_memory,
+    query_memory_map, query_memory_region, read_process_memory,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +75,14 @@ fn run() -> Result<(), String> {
 
             run_inspect_checkpoint(&path, &addresses)
         }
+        Some("plan-restore") => {
+            let path = parse_checkpoint_path(args.collect(), "plan-restore")?;
+            run_plan_restore(&path)
+        }
+        Some("reconstruct-address-space") => {
+            let arguments = parse_reconstruction_arguments(args.collect())?;
+            run_reconstruct_address_space(&arguments)
+        }
         Some("checkpoint-model") => {
             let pid = parse_pid_arguments(args.collect(), "checkpoint-model")?;
 
@@ -122,6 +135,101 @@ fn parse_pid_arguments(args: Vec<String>, command: &str) -> Result<u32, String> 
     args[1]
         .parse::<u32>()
         .map_err(|_| format!("invalid process ID '{}'", args[1]))
+}
+
+fn parse_checkpoint_path(args: Vec<String>, command: &str) -> Result<String, String> {
+    if args.len() != 1 {
+        return Err(format!("usage: wcre-cli {command} <FILE.wcr>"));
+    }
+
+    Ok(args[0].clone())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReconstructionArguments {
+    checkpoint_path: String,
+    host_pid: u32,
+    allocation_bases: Vec<u64>,
+}
+
+fn parse_reconstruction_arguments(args: Vec<String>) -> Result<ReconstructionArguments, String> {
+    if args.is_empty() {
+        return Err(reconstruction_usage());
+    }
+
+    let checkpoint_path = args[0].clone();
+    let mut host_pid = None;
+    let mut allocation_bases = BTreeSet::new();
+    let mut index = 1usize;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--host-pid" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "missing value after --host-pid".to_string())?;
+                let value = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid restore-host PID '{value}'"))?;
+
+                if host_pid.replace(value).is_some() {
+                    return Err("--host-pid may only be specified once".to_string());
+                }
+            }
+            "--allocation-base" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "missing value after --allocation-base".to_string())?;
+                let base = parse_hex_u64(value, "allocation base")?;
+
+                if !allocation_bases.insert(base) {
+                    return Err(format!(
+                        "allocation base 0x{base:016X} was specified more than once"
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unexpected argument '{other}'\n{}",
+                    reconstruction_usage()
+                ));
+            }
+        }
+
+        index += 1;
+    }
+
+    let host_pid = host_pid.ok_or_else(|| "missing required --host-pid argument".to_string())?;
+
+    if allocation_bases.is_empty() {
+        return Err(
+            "at least one explicit --allocation-base is required; inspect plan-restore output first"
+                .to_string(),
+        );
+    }
+
+    Ok(ReconstructionArguments {
+        checkpoint_path,
+        host_pid,
+        allocation_bases: allocation_bases.into_iter().collect(),
+    })
+}
+
+fn reconstruction_usage() -> String {
+    "usage: wcre-cli reconstruct-address-space <FILE.wcr> --host-pid <PID> \
+     --allocation-base <HEX> [--allocation-base <HEX> ...]"
+        .to_string()
+}
+
+fn parse_hex_u64(value: &str, label: &str) -> Result<u64, String> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+
+    u64::from_str_radix(digits, 16).map_err(|_| format!("invalid hexadecimal {label} '{value}'"))
 }
 
 fn run_inspect(pid: u32) -> Result<(), String> {
@@ -542,6 +650,339 @@ fn run_inspect_checkpoint(path: &str, addresses: &[u64]) -> Result<(), String> {
 
     Ok(())
 }
+
+fn run_plan_restore(path: &str) -> Result<(), String> {
+    let checkpoint =
+        read_checkpoint_file(path).map_err(|error| format!("failed to read '{path}': {error}"))?;
+    let plan = plan_address_space(&checkpoint)
+        .map_err(|error| format!("failed to plan address-space reconstruction: {error}"))?;
+
+    let reserve_count = plan
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation, AddressSpaceOperation::Reserve { .. }))
+        .count();
+    let commit_count = plan.operations.len() - reserve_count;
+    let private_regions = checkpoint
+        .memory_regions
+        .iter()
+        .filter(|region| region.kind == wcre_image::MemoryKind::Private)
+        .count();
+    let image_regions = checkpoint
+        .memory_regions
+        .iter()
+        .filter(|region| region.kind == wcre_image::MemoryKind::Image)
+        .count();
+    let mapped_regions = checkpoint
+        .memory_regions
+        .iter()
+        .filter(|region| region.kind == wcre_image::MemoryKind::Mapped)
+        .count();
+
+    println!("WCRE Address-Space Reconstruction Plan");
+    println!();
+    println!("{:<28}{}", "Checkpoint:", path);
+    println!("{:<28}{:?}", "Architecture:", plan.architecture);
+    println!(
+        "{:<28}{}",
+        "Captured regions:",
+        checkpoint.memory_regions.len()
+    );
+    println!("{:<28}{}", "PRIVATE regions:", private_regions);
+    println!("{:<28}{}", "IMAGE regions:", image_regions);
+    println!("{:<28}{}", "MAPPED regions:", mapped_regions);
+    println!("{:<28}{}", "Candidate regions:", plan.candidate_regions);
+    println!("{:<28}{}", "Planned reservations:", reserve_count);
+    println!("{:<28}{}", "Planned commits:", commit_count);
+    println!(
+        "{:<28}{} (0x{:X})",
+        "Reservation bytes:",
+        format_size(plan.reservation_bytes),
+        plan.reservation_bytes
+    );
+    println!(
+        "{:<28}{} (0x{:X})",
+        "Commit bytes:",
+        format_size(plan.commit_bytes),
+        plan.commit_bytes
+    );
+    println!("{:<28}{}", "Deferred regions:", plan.skipped.len());
+
+    println!();
+    println!("Operations");
+    println!("----------");
+
+    if plan.operations.is_empty() {
+        println!("(none)");
+    } else {
+        for operation in &plan.operations {
+            match operation {
+                AddressSpaceOperation::Reserve {
+                    allocation_base,
+                    size,
+                    allocation_protection,
+                    source_regions,
+                } => {
+                    let end = allocation_base + size;
+                    println!(
+                        "RESERVE  0x{allocation_base:016X}-0x{end:016X}  size=0x{size:X}  allocation_protect=0x{:08X}  source_regions={}",
+                        allocation_protection.raw,
+                        source_regions.len()
+                    );
+                }
+                AddressSpaceOperation::Commit { region } => {
+                    let end = region.base_address + region.region_size;
+                    println!(
+                        "COMMIT   0x{:016X}-0x{end:016X}  size=0x{:X}  protect=0x{:08X}  payload={}  allocation=0x{:016X}",
+                        region.base_address,
+                        region.region_size,
+                        region.protection.raw,
+                        yes_no(region.payload_id.is_some()),
+                        region.allocation_base
+                    );
+                }
+            }
+        }
+    }
+
+    println!();
+    println!("Deferred classification");
+    println!("-----------------------");
+
+    for reason in [
+        SkipReason::FreeAddressSpace,
+        SkipReason::ImageMappingDeferred,
+        SkipReason::MappedSectionDeferred,
+        SkipReason::ThreadEnvironmentBlockDeferred,
+        SkipReason::SharedSystemMappingDeferred,
+        SkipReason::UnsupportedState,
+        SkipReason::UnsupportedKind,
+        SkipReason::IncompleteAllocation,
+        SkipReason::NoCommittedPrivateMemory,
+    ] {
+        let count = plan
+            .skipped
+            .iter()
+            .filter(|skipped| skipped.reason == reason)
+            .count();
+
+        if count != 0 {
+            println!("{count:>6}  {reason}");
+        }
+    }
+
+    println!();
+    println!("Planning only: no process memory was allocated or modified.");
+    println!(
+        "Payload installation, context restoration, and execution resumption are out of scope."
+    );
+
+    Ok(())
+}
+
+fn run_reconstruct_address_space(arguments: &ReconstructionArguments) -> Result<(), String> {
+    let checkpoint = read_checkpoint_file(&arguments.checkpoint_path)
+        .map_err(|error| format!("failed to read '{}': {error}", arguments.checkpoint_path))?;
+    let plan = plan_address_space(&checkpoint)
+        .map_err(|error| format!("failed to plan address-space reconstruction: {error}"))?;
+    let host = inspect_process(arguments.host_pid).map_err(|error| {
+        format!(
+            "failed to inspect restore-host PID {}: {error}",
+            arguments.host_pid
+        )
+    })?;
+
+    if host.architecture != ProcessArchitecture::X64 {
+        return Err(format!(
+            "restore host must be x64; PID {} is {}",
+            arguments.host_pid, host.architecture
+        ));
+    }
+
+    let host_name = host
+        .image_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+
+    if !host_name.eq_ignore_ascii_case("wcre-restore-host") {
+        return Err(format!(
+            "PID {} is '{}', not the controlled wcre-restore-host executable",
+            arguments.host_pid,
+            host.image_path.display()
+        ));
+    }
+
+    for requested in &arguments.allocation_bases {
+        let planned = plan.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                AddressSpaceOperation::Reserve {
+                    allocation_base,
+                    ..
+                } if allocation_base == requested
+            )
+        });
+
+        if !planned {
+            return Err(format!(
+                "allocation base 0x{requested:016X} is not a supported reservation in the plan"
+            ));
+        }
+    }
+
+    println!("WCRE Controlled Address-Space Reconstruction");
+    println!();
+    println!("{:<28}{}", "Checkpoint:", arguments.checkpoint_path);
+    println!("{:<28}{}", "Restore-host PID:", arguments.host_pid);
+    println!("{:<28}{}", "Restore-host image:", host.image_path.display());
+    println!(
+        "{:<28}{}",
+        "Selected allocations:",
+        arguments.allocation_bases.len()
+    );
+    println!();
+
+    let mut session = ExactAddressSpaceSession::open(arguments.host_pid)
+        .map_err(|error| format!("failed to open exact-allocation session: {error}"))?;
+    let mut reconstructed = Vec::new();
+    let mut conflicts = Vec::new();
+    let mut committed_ranges = 0usize;
+
+    for requested in &arguments.allocation_bases {
+        let (size, commits) = plan
+            .operations
+            .iter()
+            .find_map(|operation| match operation {
+                AddressSpaceOperation::Reserve {
+                    allocation_base,
+                    size,
+                    ..
+                } if allocation_base == requested => Some((
+                    *size,
+                    plan.operations
+                        .iter()
+                        .filter_map(|candidate| match candidate {
+                            AddressSpaceOperation::Commit { region }
+                                if region.allocation_base == *requested =>
+                            {
+                                Some(region)
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                _ => None,
+            })
+            .expect("selected bases were validated against reserve operations");
+
+        print!("RESERVE 0x{requested:016X} size=0x{size:X} ... ");
+
+        match session.reserve_exact(*requested, size) {
+            Ok(_) => println!("EXACT"),
+            Err(error @ ExactAllocationError::AddressConflict { .. }) => {
+                println!("CONFLICT");
+                conflicts.push((*requested, size, error.to_string()));
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "exact reservation 0x{requested:016X} failed: {error}"
+                ));
+            }
+        }
+
+        let observed = session
+            .query(*requested)
+            .map_err(|error| format!("failed to verify reservation: {error}"))?;
+
+        if observed.base_address as u64 != *requested
+            || observed.allocation_base as u64 != *requested
+            || observed.state != Win32MemoryState::Reserve
+            || observed.region_size < usize::try_from(size).unwrap_or(usize::MAX)
+        {
+            return Err(format!(
+                "reservation verification mismatch at 0x{requested:016X}: {observed:?}"
+            ));
+        }
+
+        for region in commits {
+            session
+                .commit_exact(region.base_address, region.region_size)
+                .map_err(|error| {
+                    format!(
+                        "exact commit 0x{:016X} + 0x{:X} failed: {error}",
+                        region.base_address, region.region_size
+                    )
+                })?;
+            let observed = session.query(region.base_address).map_err(|error| {
+                format!(
+                    "failed to query committed range 0x{:016X}: {error}",
+                    region.base_address
+                )
+            })?;
+            let requested_end = region.base_address + region.region_size;
+            let observed_end = observed.end_address() as u64;
+
+            if observed.state != Win32MemoryState::Commit
+                || observed.allocation_base as u64 != *requested
+                || observed.base_address as u64 > region.base_address
+                || observed_end < requested_end
+            {
+                return Err(format!(
+                    "commit verification mismatch at 0x{:016X}: {observed:?}",
+                    region.base_address
+                ));
+            }
+
+            println!(
+                "  COMMIT 0x{:016X}-0x{requested_end:016X} ... EXACT",
+                region.base_address
+            );
+            committed_ranges += 1;
+        }
+
+        reconstructed.push((*requested, size));
+    }
+
+    println!();
+    println!("Reconstruction results");
+    println!("----------------------");
+    println!("{:<28}{}", "Exact reservations:", reconstructed.len());
+    println!("{:<28}{}", "Exact committed ranges:", committed_ranges);
+    println!("{:<28}{}", "Address conflicts:", conflicts.len());
+
+    for (base, size, error) in &conflicts {
+        println!("CONFLICT 0x{base:016X} size=0x{size:X}: {error}");
+    }
+
+    session
+        .release_all()
+        .map_err(|error| format!("failed to clean up reconstructed ranges: {error}"))?;
+
+    for (base, _) in &reconstructed {
+        let observed = query_memory_region(arguments.host_pid, *base as usize)
+            .map_err(|error| format!("failed to verify cleanup at 0x{base:016X}: {error}"))?;
+
+        if observed.state != Win32MemoryState::Free {
+            return Err(format!(
+                "cleanup verification failed at 0x{base:016X}: {observed:?}"
+            ));
+        }
+    }
+
+    println!("{:<28}VERIFIED", "Temporary cleanup:");
+    println!();
+    println!("No checkpoint payload bytes or thread contexts were installed.");
+    println!("No captured execution was resumed.");
+
+    if reconstructed.is_empty() {
+        return Err("no selected allocation could be reconstructed exactly".to_string());
+    }
+
+    Ok(())
+}
+
 fn run_checkpoint_model(pid: u32) -> Result<(), String> {
     let checkpoint = capture_checkpoint_model(pid).map_err(|error| {
         format!("failed to capture WCRE checkpoint model for PID {pid}: {error}")
@@ -1367,7 +1808,7 @@ fn format_size(bytes: u64) -> String {
 fn print_help() {
     println!("WCRE - Windows Checkpoint/Restore Engine");
     println!("Version: 0.0.1-dev");
-    println!("Milestone: M0 - Process State Capture");
+    println!("Milestone: M1 - Exact VA Reconstruction Research");
     println!();
 
     println!("Usage:");
@@ -1377,6 +1818,10 @@ fn print_help() {
     println!("  wcre-cli snapshot --pid <PID>");
     println!("  wcre-cli checkpoint --pid <PID> --output <FILE.wcr> [--format <v1|v2>]");
     println!("  wcre-cli inspect-checkpoint <FILE.wcr> [--address <HEX> ...]");
+    println!("  wcre-cli plan-restore <FILE.wcr>");
+    println!(
+        "  wcre-cli reconstruct-address-space <FILE.wcr> --host-pid <PID> --allocation-base <HEX> [--allocation-base <HEX> ...]"
+    );
     println!("  wcre-cli checkpoint-model --pid <PID>");
     println!("  wcre-cli snapshot-images --pid <PID>");
     println!("  wcre-cli snapshot-threads --pid <PID>");
@@ -1466,5 +1911,78 @@ mod tests {
         .expect_err("duplicate checkpoint format must fail");
 
         assert_eq!(error, "--format may only be specified once");
+    }
+
+    #[test]
+    fn plan_restore_requires_exactly_one_checkpoint_path() {
+        assert_eq!(
+            parse_checkpoint_path(strings(&["checkpoint.wcr"]), "plan-restore")
+                .expect("one checkpoint path should parse"),
+            "checkpoint.wcr"
+        );
+        assert!(parse_checkpoint_path(Vec::new(), "plan-restore").is_err());
+        assert!(parse_checkpoint_path(strings(&["one.wcr", "two.wcr"]), "plan-restore").is_err());
+    }
+
+    #[test]
+    fn reconstruction_arguments_require_explicit_sorted_allocations() {
+        let parsed = parse_reconstruction_arguments(strings(&[
+            "checkpoint.wcr",
+            "--allocation-base",
+            "0x30000",
+            "--host-pid",
+            "4242",
+            "--allocation-base",
+            "10000",
+        ]))
+        .expect("reconstruction arguments should parse");
+
+        assert_eq!(
+            parsed,
+            ReconstructionArguments {
+                checkpoint_path: "checkpoint.wcr".to_string(),
+                host_pid: 4242,
+                allocation_bases: vec![0x10000, 0x30000],
+            }
+        );
+    }
+
+    #[test]
+    fn reconstruction_arguments_reject_missing_allocation_selection() {
+        let error =
+            parse_reconstruction_arguments(strings(&["checkpoint.wcr", "--host-pid", "4242"]))
+                .expect_err("an explicit allocation must be required");
+
+        assert!(error.contains("at least one explicit --allocation-base"));
+    }
+
+    #[test]
+    fn reconstruction_arguments_reject_duplicate_allocation() {
+        let error = parse_reconstruction_arguments(strings(&[
+            "checkpoint.wcr",
+            "--host-pid",
+            "4242",
+            "--allocation-base",
+            "0x10000",
+            "--allocation-base",
+            "10000",
+        ]))
+        .expect_err("duplicate allocation base must fail");
+
+        assert!(error.contains("specified more than once"));
+    }
+
+    #[test]
+    fn reconstruction_arguments_reject_invalid_hexadecimal_allocation() {
+        let error = parse_reconstruction_arguments(strings(&[
+            "checkpoint.wcr",
+            "--host-pid",
+            "4242",
+            "--allocation-base",
+            "not-hex",
+        ]))
+        .expect_err("invalid hexadecimal allocation base must fail");
+
+        assert!(error.contains("invalid hexadecimal allocation base"));
     }
 }
