@@ -2,7 +2,8 @@ use std::env;
 use std::process::ExitCode;
 
 use wcre_win32::{
-    MemoryTypeReadSummary, capture_thread_contexts, capture_va_clone, compare_va_clone_memory,
+    MemoryTypeReadSummary, capture_snapshot_probe, capture_thread_contexts,
+    capture_thread_state_validation, capture_va_clone, compare_va_clone_memory,
     diff_va_clone_private_memory, inspect_process, query_memory_map, read_process_memory,
 };
 
@@ -46,6 +47,15 @@ fn run() -> Result<(), String> {
             run_snapshot_threads(pid)
         }
 
+        Some("snapshot-thread-validate") => {
+            let pid = parse_pid_arguments(args.collect(), "snapshot-thread-validate")?;
+
+            run_snapshot_thread_validate(pid)
+        }
+        Some("snapshot-probe-u64") => {
+            let (pid, addresses) = parse_snapshot_probe_arguments(args.collect())?;
+            run_snapshot_probe_u64(pid, &addresses)
+        }
         Some("snapshot-verify") => {
             let pid = parse_pid_arguments(args.collect(), "snapshot-verify")?;
             run_snapshot_verify(pid)
@@ -241,12 +251,15 @@ fn run_snapshot_threads(pid: u32) -> Result<(), String> {
     println!();
     println!("Captured threads");
     println!("----------------");
+    print!("{:<8} ", "PID");
     println!(
         "{:<8} {:<11} {:<6} {:<10} {:<18} {:<18} {:>7} {:<18} {:<18} {:<18}",
         "TID", "State", "Flags", "Exit", "TEB", "Start", "Suspend", "RIP", "RSP", "RBP"
     );
 
     for thread in &report.threads {
+        print!("{:<8} ", thread.process_id);
+
         if let Some(context) = &thread.context {
             println!(
                 "{:<8} {:<11} {:04X}   {:<10} {:016X}  {:016X}  {:>7} {:016X}  {:016X}  {:016X}",
@@ -298,6 +311,269 @@ fn run_snapshot_threads(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
+fn run_snapshot_thread_validate(pid: u32) -> Result<(), String> {
+    let report = capture_thread_state_validation(pid).map_err(|error| {
+        format!("failed to validate captured thread state for PID {pid}: {error}")
+    })?;
+
+    println!("WCRE PSS Thread-State Validator");
+    println!();
+
+    println!("{:<24}{}", "Source PID:", report.source_pid);
+    println!("{:<24}{}", "VA clone PID:", report.clone_pid);
+    println!("{:<24}{}", "Live threads:", report.live_threads);
+    println!("{:<24}{}", "Validated contexts:", report.validations.len());
+    println!("{:<24}{}", "Missing contexts:", report.missing_contexts());
+    println!("{:<24}{}", "All invariants:", yes_no(report.all_valid()));
+
+    for validation in &report.validations {
+        println!();
+        println!("Thread {}", validation.thread_id);
+        println!("----------------");
+
+        println!("{:<26}{:016X}", "TEB:", validation.teb_base_address);
+
+        match validation.teb_self {
+            Some(value) => println!("{:<26}{:016X}", "TEB.Self:", value),
+            None => println!("{:<26}{}", "TEB.Self:", "<unreadable>"),
+        }
+
+        match validation.stack_limit {
+            Some(value) => println!("{:<26}{:016X}", "StackLimit:", value),
+            None => println!("{:<26}{}", "StackLimit:", "<unreadable>"),
+        }
+
+        match validation.stack_base {
+            Some(value) => println!("{:<26}{:016X}", "StackBase:", value),
+            None => println!("{:<26}{}", "StackBase:", "<unreadable>"),
+        }
+
+        println!("{:<26}{:016X}", "RIP:", validation.rip);
+        println!("{:<26}{:016X}", "RSP:", validation.rsp);
+        println!("{:<26}{:016X}", "RBP:", validation.rbp);
+
+        println!();
+        println!(
+            "{:<26}{}",
+            "TEB self valid:",
+            yes_no(validation.teb_self_valid)
+        );
+
+        println!(
+            "{:<26}{}",
+            "Stack bounds valid:",
+            yes_no(validation.stack_bounds_valid)
+        );
+
+        println!(
+            "{:<26}{}",
+            "RSP inside TIB stack:",
+            yes_no(validation.rsp_in_reported_stack)
+        );
+
+        println!(
+            "{:<26}{}",
+            "RIP executable image:",
+            yes_no(validation.rip_in_committed_executable_image)
+        );
+
+        println!(
+            "{:<26}{}",
+            "RSP committed private:",
+            yes_no(validation.rsp_in_committed_private)
+        );
+
+        println!();
+        println!("RIP region");
+
+        match &validation.rip_region {
+            Some(region) => {
+                println!(
+                    "  {:016X}-{:016X}  {} {} {}",
+                    region.base_address,
+                    region.end_address(),
+                    region.state,
+                    region.kind,
+                    region.protection
+                );
+            }
+
+            None => {
+                println!("  <no mapped region>");
+            }
+        }
+
+        println!("RSP region");
+
+        match &validation.rsp_region {
+            Some(region) => {
+                println!(
+                    "  {:016X}-{:016X}  {} {} {}",
+                    region.base_address,
+                    region.end_address(),
+                    region.state,
+                    region.kind,
+                    region.protection
+                );
+            }
+
+            None => {
+                println!("  <no mapped region>");
+            }
+        }
+
+        println!("{:<26}{}", "Thread validation:", yes_no(validation.valid()));
+    }
+
+    if !report.all_valid() {
+        return Err("one or more live-thread checkpoint invariants failed".to_string());
+    }
+
+    Ok(())
+}
+fn parse_hex_address(value: &str) -> Result<usize, String> {
+    let value = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+
+    usize::from_str_radix(value, 16).map_err(|_| format!("invalid hexadecimal address '0x{value}'"))
+}
+
+fn parse_snapshot_probe_arguments(args: Vec<String>) -> Result<(u32, Vec<usize>), String> {
+    let mut pid = None;
+    let mut addresses = Vec::new();
+
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--pid" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing value after --pid".to_string())?;
+
+                let parsed = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid process ID '{value}'"))?;
+
+                if pid.replace(parsed).is_some() {
+                    return Err("--pid may only be specified once".to_string());
+                }
+            }
+
+            "--address" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing value after --address".to_string())?;
+
+                addresses.push(parse_hex_address(&value)?);
+            }
+
+            other => {
+                return Err(format!(
+                    "unexpected argument '{other}'`nusage: wcre-cli snapshot-probe-u64 --pid <PID> --address <HEX> [--address <HEX> ...]"
+                ));
+            }
+        }
+    }
+
+    let pid = pid.ok_or_else(|| "missing required --pid argument".to_string())?;
+
+    if addresses.is_empty() {
+        return Err("at least one --address is required".to_string());
+    }
+
+    Ok((pid, addresses))
+}
+
+fn run_snapshot_probe_u64(pid: u32, addresses: &[usize]) -> Result<(), String> {
+    let report = capture_snapshot_probe(pid, addresses).map_err(|error| {
+        format!("failed to capture PSS correlation probe for PID {pid}: {error}")
+    })?;
+
+    println!("WCRE PSS Execution-State Correlation Probe");
+    println!();
+
+    println!("{:<24}{}", "Source PID:", report.source_pid);
+    println!("{:<24}{}", "VA clone PID:", report.clone_pid);
+    println!("{:<24}{}", "Thread entries:", report.threads.len());
+    println!("{:<24}{}", "Values requested:", report.reads.len());
+
+    println!();
+    println!("Thread contexts");
+    println!("---------------");
+    println!(
+        "{:<8} {:<8} {:<11} {:<18} {:<18} {:<18}",
+        "PID", "TID", "State", "RIP", "RSP", "RBP"
+    );
+
+    for thread in &report.threads {
+        if let Some(context) = &thread.context {
+            println!(
+                "{:<8} {:<8} {:<11} {:016X}  {:016X}  {:016X}",
+                thread.process_id,
+                thread.thread_id,
+                if thread.terminated {
+                    "TERMINATED"
+                } else {
+                    "LIVE"
+                },
+                context.rip,
+                context.rsp,
+                context.rbp,
+            );
+        } else {
+            println!(
+                "{:<8} {:<8} {:<11} {}",
+                thread.process_id,
+                thread.thread_id,
+                if thread.terminated {
+                    "TERMINATED"
+                } else {
+                    "LIVE"
+                },
+                "NO CONTEXT",
+            );
+        }
+    }
+
+    println!();
+    println!("Exact 64-bit snapshot reads");
+    println!("---------------------------");
+    println!("{:<18} {:<18} {:>5}", "Address", "Value", "Bytes");
+
+    let mut failed = 0usize;
+
+    for read in &report.reads {
+        match read.value {
+            Some(value) => {
+                println!(
+                    "{:016X}  {:016X}  {:>5}",
+                    read.address, value, read.bytes_read
+                );
+            }
+
+            None => {
+                failed += 1;
+
+                println!(
+                    "{:016X}  {:<18}  {:>5}  {}",
+                    read.address,
+                    "READ FAILED",
+                    read.bytes_read,
+                    read.error.as_deref().unwrap_or("short read")
+                );
+            }
+        }
+    }
+
+    if failed != 0 {
+        return Err(format!("{failed} exact snapshot memory reads failed"));
+    }
+
+    Ok(())
+}
 fn run_snapshot_verify(pid: u32) -> Result<(), String> {
     let comparison = compare_va_clone_memory(pid)
         .map_err(|error| format!("failed to verify PSS VA clone for PID {pid}: {error}"))?;
