@@ -6,7 +6,7 @@ use crate::format::{
     ARCH_ARM32, ARCH_ARM64, ARCH_IA64, ARCH_UNKNOWN_FLAG, ARCH_X64, ARCH_X86, MEMORY_KIND_IMAGE,
     MEMORY_KIND_MAPPED, MEMORY_KIND_NONE, MEMORY_KIND_PRIVATE, MEMORY_KIND_UNKNOWN,
     MEMORY_STATE_COMMIT, MEMORY_STATE_FREE, MEMORY_STATE_RESERVE, MEMORY_STATE_UNKNOWN,
-    WCR_FLAGS_NONE, WCR_FORMAT_VERSION, WCR_HEADER_SIZE, WCR_MAGIC,
+    WCR_FLAGS_NONE, WCR_FORMAT_VERSION, WCR_MAGIC,
 };
 use crate::{Architecture, CheckpointModel, MemoryKind, MemoryState, ThreadRecord, WcrError};
 
@@ -21,23 +21,7 @@ pub fn write_checkpoint<W: Write>(
         });
     }
 
-    if !checkpoint.payload_links_valid() {
-        return Err(WcrError::InvalidData(
-            "checkpoint contains invalid payload links",
-        ));
-    }
-
-    if !checkpoint.payload_ids_unique() {
-        return Err(WcrError::InvalidData(
-            "checkpoint contains duplicate payload IDs",
-        ));
-    }
-
-    if !checkpoint.every_payload_referenced_once() {
-        return Err(WcrError::InvalidData(
-            "checkpoint contains unreferenced or multiply-referenced payloads",
-        ));
-    }
+    checkpoint.validate_semantics()?;
 
     let image_count = checked_len(checkpoint.images.len(), "image count")?;
     let region_count = checked_len(checkpoint.memory_regions.len(), "memory-region count")?;
@@ -56,8 +40,6 @@ pub fn write_checkpoint<W: Write>(
     write_u32(&mut writer, region_count)?;
     write_u32(&mut writer, payload_count)?;
     write_u32(&mut writer, thread_count)?;
-
-    debug_assert_eq!(WCR_HEADER_SIZE, 40);
 
     write_u32(&mut writer, checkpoint.process.captured_pid)?;
     write_string(&mut writer, &checkpoint.process.image_path)?;

@@ -4,10 +4,10 @@ use std::path::Path;
 
 use crate::format::{
     ARCH_ARM32, ARCH_ARM64, ARCH_IA64, ARCH_UNKNOWN_FLAG, ARCH_UNKNOWN_VALUE_MASK, ARCH_X64,
-    ARCH_X86, MAX_COLLECTION_ITEMS, MAX_SINGLE_PAYLOAD_BYTES, MAX_STRING_BYTES, MEMORY_KIND_IMAGE,
-    MEMORY_KIND_MAPPED, MEMORY_KIND_NONE, MEMORY_KIND_PRIVATE, MEMORY_KIND_UNKNOWN,
-    MEMORY_STATE_COMMIT, MEMORY_STATE_FREE, MEMORY_STATE_RESERVE, MEMORY_STATE_UNKNOWN,
-    WCR_FORMAT_VERSION, WCR_HEADER_SIZE, WCR_MAGIC,
+    ARCH_X86, MAX_COLLECTION_ITEMS, MAX_SINGLE_PAYLOAD_BYTES, MAX_STRING_BYTES,
+    MAX_TOTAL_PAYLOAD_BYTES, MEMORY_KIND_IMAGE, MEMORY_KIND_MAPPED, MEMORY_KIND_NONE,
+    MEMORY_KIND_PRIVATE, MEMORY_KIND_UNKNOWN, MEMORY_STATE_COMMIT, MEMORY_STATE_FREE,
+    MEMORY_STATE_RESERVE, MEMORY_STATE_UNKNOWN, WCR_FORMAT_VERSION, WCR_MAGIC,
 };
 use crate::{
     Architecture, CHECKPOINT_MODEL_VERSION, CheckpointModel, ImageRecord, MemoryKind,
@@ -53,8 +53,6 @@ pub fn read_checkpoint<R: Read>(mut reader: R) -> Result<CheckpointModel, WcrErr
     let payload_count = checked_count(read_u32(&mut reader)?, "memory-payload count")?;
     let thread_count = checked_count(read_u32(&mut reader)?, "thread count")?;
 
-    debug_assert_eq!(WCR_HEADER_SIZE, 40);
-
     let captured_pid = read_u32(&mut reader)?;
     let image_path = read_string(&mut reader)?;
 
@@ -67,7 +65,7 @@ pub fn read_checkpoint<R: Read>(mut reader: R) -> Result<CheckpointModel, WcrErr
     let mut checkpoint = CheckpointModel::new(process);
     checkpoint.model_version = model_version;
 
-    checkpoint.images.reserve(image_count);
+    reserve_vec(&mut checkpoint.images, image_count, "image records")?;
 
     for _ in 0..image_count {
         checkpoint.images.push(ImageRecord {
@@ -80,7 +78,11 @@ pub fn read_checkpoint<R: Read>(mut reader: R) -> Result<CheckpointModel, WcrErr
         });
     }
 
-    checkpoint.memory_regions.reserve(region_count);
+    reserve_vec(
+        &mut checkpoint.memory_regions,
+        region_count,
+        "memory-region records",
+    )?;
 
     for _ in 0..region_count {
         let base_address = read_u64(&mut reader)?;
@@ -115,7 +117,13 @@ pub fn read_checkpoint<R: Read>(mut reader: R) -> Result<CheckpointModel, WcrErr
         });
     }
 
-    checkpoint.payloads.reserve(payload_count);
+    reserve_vec(
+        &mut checkpoint.payloads,
+        payload_count,
+        "memory-payload records",
+    )?;
+
+    let mut total_payload_bytes = 0u64;
 
     for _ in 0..payload_count {
         let id = read_u64(&mut reader)?;
@@ -128,10 +136,25 @@ pub fn read_checkpoint<R: Read>(mut reader: R) -> Result<CheckpointModel, WcrErr
             ));
         }
 
+        total_payload_bytes =
+            total_payload_bytes
+                .checked_add(byte_length)
+                .ok_or(WcrError::InvalidData(
+                    "total payload byte count overflows u64",
+                ))?;
+
+        if total_payload_bytes > MAX_TOTAL_PAYLOAD_BYTES {
+            return Err(WcrError::InvalidData(
+                "total payload bytes exceed v1 defensive limit",
+            ));
+        }
+
         let length = usize::try_from(byte_length)
             .map_err(|_| WcrError::ValueOutOfRange("payload byte length"))?;
 
-        let mut bytes = vec![0u8; length];
+        let mut bytes = Vec::new();
+        reserve_vec(&mut bytes, length, "payload bytes")?;
+        bytes.resize(length, 0);
         reader.read_exact(&mut bytes)?;
 
         checkpoint.payloads.push(MemoryPayload {
@@ -141,29 +164,13 @@ pub fn read_checkpoint<R: Read>(mut reader: R) -> Result<CheckpointModel, WcrErr
         });
     }
 
-    checkpoint.threads.reserve(thread_count);
+    reserve_vec(&mut checkpoint.threads, thread_count, "thread records")?;
 
     for _ in 0..thread_count {
         checkpoint.threads.push(read_thread(&mut reader)?);
     }
 
-    if !checkpoint.payload_links_valid() {
-        return Err(WcrError::InvalidData(
-            "decoded checkpoint contains invalid payload links",
-        ));
-    }
-
-    if !checkpoint.payload_ids_unique() {
-        return Err(WcrError::InvalidData(
-            "decoded checkpoint contains duplicate payload IDs",
-        ));
-    }
-
-    if !checkpoint.every_payload_referenced_once() {
-        return Err(WcrError::InvalidData(
-            "decoded checkpoint contains unreferenced or multiply-referenced payloads",
-        ));
-    }
+    checkpoint.validate_semantics()?;
 
     let mut trailing = [0u8; 1];
 
@@ -281,6 +288,11 @@ fn checked_count(value: u32, _name: &'static str) -> Result<usize, WcrError> {
     usize::try_from(value).map_err(|_| WcrError::ValueOutOfRange("collection count"))
 }
 
+fn reserve_vec<T>(vec: &mut Vec<T>, additional: usize, name: &'static str) -> Result<(), WcrError> {
+    vec.try_reserve_exact(additional)
+        .map_err(|_| WcrError::AllocationFailed(name))
+}
+
 fn read_option_string<R: Read>(reader: &mut R) -> Result<Option<String>, WcrError> {
     if read_bool(reader)? {
         Ok(Some(read_string(reader)?))
@@ -308,7 +320,9 @@ fn read_string<R: Read>(reader: &mut R) -> Result<String, WcrError> {
 
     let length = usize::try_from(length).map_err(|_| WcrError::ValueOutOfRange("string length"))?;
 
-    let mut bytes = vec![0u8; length];
+    let mut bytes = Vec::new();
+    reserve_vec(&mut bytes, length, "string bytes")?;
+    bytes.resize(length, 0);
     reader.read_exact(&mut bytes)?;
 
     String::from_utf8(bytes).map_err(|_| WcrError::InvalidUtf8)

@@ -8,21 +8,6 @@ pub const WCR_MAGIC: [u8; 8] = *b"WCREWCR\0";
 /// This is deliberately independent from `CHECKPOINT_MODEL_VERSION`.
 pub const WCR_FORMAT_VERSION: u32 = 1;
 
-/// Current fixed header size in bytes.
-///
-/// Layout:
-///
-/// - magic:              8 bytes
-/// - format_version:     4 bytes
-/// - model_version:      4 bytes
-/// - architecture:       4 bytes
-/// - flags:              4 bytes
-/// - image_count:        4 bytes
-/// - region_count:       4 bytes
-/// - payload_count:      4 bytes
-/// - thread_count:       4 bytes
-pub const WCR_HEADER_SIZE: u32 = 40;
-
 /// No format flags are currently defined.
 pub const WCR_FLAGS_NONE: u32 = 0;
 
@@ -54,3 +39,9 @@ pub const MEMORY_KIND_UNKNOWN: u32 = 0xFFFF_FFFF;
 pub const MAX_COLLECTION_ITEMS: u32 = 1_000_000;
 pub const MAX_STRING_BYTES: u32 = 16 * 1024 * 1024;
 pub const MAX_SINGLE_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Maximum cumulative payload bytes accepted by the v1 decoder.
+///
+/// This is a parser-safety budget rather than a statement about the
+/// eventual WCRE workload or migration envelope.
+pub const MAX_TOTAL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024 * 1024;

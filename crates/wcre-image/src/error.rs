@@ -11,8 +11,6 @@ pub enum WcrError {
 
     UnsupportedModelVersion { observed: u32, supported: u32 },
 
-    InvalidHeaderSize { observed: u32, expected: u32 },
-
     InvalidArchitecture(u32),
 
     InvalidBoolean(u8),
@@ -20,6 +18,8 @@ pub enum WcrError {
     InvalidUtf8,
 
     InvalidData(&'static str),
+
+    AllocationFailed(&'static str),
 
     ValueOutOfRange(&'static str),
 }
@@ -49,11 +49,6 @@ impl fmt::Display for WcrError {
                 "unsupported checkpoint model version {observed}; supported version is {supported}"
             ),
 
-            Self::InvalidHeaderSize { observed, expected } => write!(
-                f,
-                "invalid .wcr header size {observed}; expected {expected}"
-            ),
-
             Self::InvalidArchitecture(value) => {
                 write!(f, "invalid architecture encoding 0x{value:08X}")
             }
@@ -68,6 +63,10 @@ impl fmt::Display for WcrError {
 
             Self::InvalidData(message) => {
                 write!(f, "invalid .wcr data: {message}")
+            }
+
+            Self::AllocationFailed(name) => {
+                write!(f, "unable to allocate memory while decoding .wcr {name}")
             }
 
             Self::ValueOutOfRange(name) => {
