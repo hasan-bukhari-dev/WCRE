@@ -1,7 +1,8 @@
-[package]
+﻿[package]
 name = "wcre-cli"
 version = "0.0.1"
 edition = "2024"
 
 [dependencies]
+wcre-image = { path = "../wcre-image" }
 wcre-win32 = { version = "0.0.1", path = "../wcre-win32" }

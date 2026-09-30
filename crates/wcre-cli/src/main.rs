@@ -1,6 +1,8 @@
 use std::env;
 use std::process::ExitCode;
 
+use wcre_image::{read_checkpoint_file, write_checkpoint_file};
+
 use wcre_win32::{
     MemoryTypeReadSummary, capture_checkpoint_model, capture_image_inventory,
     capture_snapshot_probe, capture_thread_contexts, capture_thread_state_validation,
@@ -43,6 +45,16 @@ fn run() -> Result<(), String> {
             run_snapshot(pid)
         }
 
+        Some("checkpoint") => {
+            let (pid, output) = parse_checkpoint_arguments(args.collect())?;
+            run_checkpoint(pid, &output)
+        }
+
+        Some("inspect-checkpoint") => {
+            let (path, addresses) = parse_inspect_checkpoint_arguments(args.collect())?;
+
+            run_inspect_checkpoint(&path, &addresses)
+        }
         Some("checkpoint-model") => {
             let pid = parse_pid_arguments(args.collect(), "checkpoint-model")?;
 
@@ -220,6 +232,267 @@ fn run_snapshot(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_checkpoint_arguments(args: Vec<String>) -> Result<(u32, String), String> {
+    let mut pid = None;
+    let mut output = None;
+
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--pid" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing value after --pid".to_string())?;
+
+                let value = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid process ID '{value}'"))?;
+
+                if pid.replace(value).is_some() {
+                    return Err("--pid may only be specified once".to_string());
+                }
+            }
+
+            "--output" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing value after --output".to_string())?;
+
+                if output.replace(value).is_some() {
+                    return Err("--output may only be specified once".to_string());
+                }
+            }
+
+            other => {
+                return Err(format!(
+                    "unexpected argument '{other}'\n\
+                     usage: wcre-cli checkpoint --pid <PID> --output <FILE.wcr>"
+                ));
+            }
+        }
+    }
+
+    let pid = pid.ok_or_else(|| "missing required --pid argument".to_string())?;
+
+    let output = output.ok_or_else(|| "missing required --output argument".to_string())?;
+
+    Ok((pid, output))
+}
+
+fn parse_inspect_checkpoint_arguments(args: Vec<String>) -> Result<(String, Vec<u64>), String> {
+    if args.is_empty() {
+        return Err("usage: wcre-cli inspect-checkpoint <FILE.wcr> \
+             [--address <HEX> ...]"
+            .to_string());
+    }
+
+    let path = args[0].clone();
+    let mut addresses = Vec::new();
+    let mut index = 1usize;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--address" => {
+                index += 1;
+
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "missing value after --address".to_string())?;
+
+                let value = value
+                    .strip_prefix("0x")
+                    .or_else(|| value.strip_prefix("0X"))
+                    .unwrap_or(value);
+
+                let address = u64::from_str_radix(value, 16)
+                    .map_err(|_| format!("invalid hexadecimal address '{value}'"))?;
+
+                addresses.push(address);
+            }
+
+            other => {
+                return Err(format!(
+                    "unexpected argument '{other}'\n\
+                     usage: wcre-cli inspect-checkpoint <FILE.wcr> \
+                     [--address <HEX> ...]"
+                ));
+            }
+        }
+
+        index += 1;
+    }
+
+    Ok((path, addresses))
+}
+
+fn run_checkpoint(pid: u32, output: &str) -> Result<(), String> {
+    let checkpoint = capture_checkpoint_model(pid).map_err(|error| {
+        format!("failed to capture WCRE checkpoint model for PID {pid}: {error}")
+    })?;
+
+    if checkpoint.payloads.is_empty() {
+        return Err("checkpoint model contains no captured memory payloads".to_string());
+    }
+
+    if !checkpoint.payload_links_valid()
+        || !checkpoint.payload_ids_unique()
+        || !checkpoint.every_payload_referenced_once()
+    {
+        return Err("checkpoint model failed memory-payload integrity checks".to_string());
+    }
+
+    write_checkpoint_file(&checkpoint, output)
+        .map_err(|error| format!("failed to write '{output}': {error}"))?;
+
+    let file_size = std::fs::metadata(output)
+        .map_err(|error| format!("failed to stat '{output}': {error}"))?
+        .len();
+
+    println!("WCRE Persistent Checkpoint");
+    println!();
+    println!("{:<24}{}", "Source PID:", pid);
+    println!("{:<24}{}", "Output:", output);
+    println!(
+        "{:<24}{}",
+        "Architecture:",
+        format!("{:?}", checkpoint.process.architecture)
+    );
+    println!("{:<24}{}", "Loaded images:", checkpoint.images.len());
+    println!(
+        "{:<24}{}",
+        "Memory regions:",
+        checkpoint.memory_regions.len()
+    );
+    println!("{:<24}{}", "Memory payloads:", checkpoint.payloads.len());
+    println!("{:<24}{}", "Live threads:", checkpoint.threads.len());
+    println!(
+        "{:<24}{}",
+        "Payload bytes:",
+        format_size(checkpoint.payload_bytes())
+    );
+    println!("{:<24}{}", "File size:", format_size(file_size));
+    println!();
+    println!("Persistent checkpoint written successfully.");
+
+    Ok(())
+}
+
+fn run_inspect_checkpoint(path: &str, addresses: &[u64]) -> Result<(), String> {
+    let checkpoint =
+        read_checkpoint_file(path).map_err(|error| format!("failed to read '{path}': {error}"))?;
+
+    let file_size = std::fs::metadata(path)
+        .map_err(|error| format!("failed to stat '{path}': {error}"))?
+        .len();
+
+    println!("WCRE Offline Checkpoint Inspector");
+    println!();
+
+    println!("{:<24}{}", "Checkpoint file:", path);
+    println!("{:<24}{}", "File size:", format_size(file_size));
+    println!("{:<24}{}", "Model version:", checkpoint.model_version);
+    println!("{:<24}{}", "Captured PID:", checkpoint.process.captured_pid);
+    println!(
+        "{:<24}{:?}",
+        "Architecture:", checkpoint.process.architecture
+    );
+    println!("{:<24}{}", "Process image:", checkpoint.process.image_path);
+    println!("{:<24}{}", "Loaded images:", checkpoint.images.len());
+    println!(
+        "{:<24}{}",
+        "Memory regions:",
+        checkpoint.memory_regions.len()
+    );
+    println!("{:<24}{}", "Memory payloads:", checkpoint.payloads.len());
+    println!("{:<24}{}", "Live threads:", checkpoint.threads.len());
+    println!(
+        "{:<24}{}",
+        "Payload bytes:",
+        format_size(checkpoint.payload_bytes())
+    );
+
+    println!();
+    println!("Integrity");
+    println!("---------");
+    println!(
+        "{:<28}{}",
+        "Payload links valid:",
+        yes_no(checkpoint.payload_links_valid())
+    );
+    println!(
+        "{:<28}{}",
+        "Payload IDs unique:",
+        yes_no(checkpoint.payload_ids_unique())
+    );
+    println!(
+        "{:<28}{}",
+        "Every payload referenced:",
+        yes_no(checkpoint.every_payload_referenced_once())
+    );
+
+    if !checkpoint.threads.is_empty() {
+        println!();
+        println!("Threads");
+        println!("-------");
+
+        for thread in &checkpoint.threads {
+            println!(
+                "TID {:<8} TEB {:016X}",
+                thread.thread_id, thread.teb_base_address
+            );
+
+            match (thread.stack_limit, thread.stack_base) {
+                (Some(limit), Some(base)) => {
+                    println!("  stack {:016X}-{:016X}", limit, base);
+                }
+
+                _ => println!("  stack <unavailable>"),
+            }
+
+            match &thread.context {
+                Some(context) => {
+                    let owner = checkpoint
+                        .images
+                        .iter()
+                        .find(|image| image.contains(context.rip));
+
+                    println!(
+                        "  RIP   {:016X} -> {}",
+                        context.rip,
+                        owner
+                            .and_then(|image| image.mapped_path.as_deref())
+                            .unwrap_or("<no captured image>")
+                    );
+
+                    println!("  RSP   {:016X}", context.rsp);
+                }
+
+                None => println!("  context <unavailable>"),
+            }
+        }
+    }
+
+    if !addresses.is_empty() {
+        println!();
+        println!("Offline memory reads");
+        println!("--------------------");
+
+        for &address in addresses {
+            match checkpoint.read_u64(address) {
+                Some(value) => {
+                    println!("0x{address:016X}  0x{value:016X}");
+                }
+
+                None => {
+                    println!("0x{address:016X}  <not captured>");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
 fn run_checkpoint_model(pid: u32) -> Result<(), String> {
     let checkpoint = capture_checkpoint_model(pid).map_err(|error| {
         format!("failed to capture WCRE checkpoint model for PID {pid}: {error}")
@@ -1053,6 +1326,8 @@ fn print_help() {
     println!("  wcre-cli memory-map --pid <PID>");
     println!("  wcre-cli memory-read --pid <PID>");
     println!("  wcre-cli snapshot --pid <PID>");
+    println!("  wcre-cli checkpoint --pid <PID> --output <FILE.wcr>");
+    println!("  wcre-cli inspect-checkpoint <FILE.wcr> [--address <HEX> ...]");
     println!("  wcre-cli checkpoint-model --pid <PID>");
     println!("  wcre-cli snapshot-images --pid <PID>");
     println!("  wcre-cli snapshot-threads --pid <PID>");
