@@ -21,6 +21,11 @@ pub enum WcrError {
 
     AllocationFailed(&'static str),
 
+    IntegrityMismatch,
+    UnsupportedIntegrityAlgorithm(u32),
+    InvalidHeaderSize { observed: u32, expected: u32 },
+    BodyLengthMismatch { declared: u64, consumed: u64 },
+
     ValueOutOfRange(&'static str),
 }
 
@@ -67,6 +72,28 @@ impl fmt::Display for WcrError {
 
             Self::AllocationFailed(name) => {
                 write!(f, "unable to allocate memory while decoding .wcr {name}")
+            }
+
+            Self::IntegrityMismatch => {
+                write!(f, ".wcr integrity verification failed")
+            }
+
+            Self::UnsupportedIntegrityAlgorithm(algorithm) => {
+                write!(f, "unsupported .wcr integrity algorithm {algorithm}")
+            }
+
+            Self::InvalidHeaderSize { observed, expected } => {
+                write!(
+                    f,
+                    "invalid .wcr header size {observed}; expected {expected}"
+                )
+            }
+
+            Self::BodyLengthMismatch { declared, consumed } => {
+                write!(
+                    f,
+                    ".wcr body length mismatch: declared {declared} bytes, consumed {consumed}"
+                )
             }
 
             Self::ValueOutOfRange(name) => {

@@ -3,10 +3,40 @@
 /// ASCII: "WCREWCR\0"
 pub const WCR_MAGIC: [u8; 8] = *b"WCREWCR\0";
 
-/// Version of the persistent `.wcr` binary format.
+/// Original persistent `.wcr` binary format.
+pub const WCR_FORMAT_VERSION_V1: u32 = 1;
+
+/// Integrity-protected `.wcr` format.
+pub const WCR_FORMAT_VERSION_V2: u32 = 2;
+
+/// Current format emitted by the eventual default writer.
 ///
-/// This is deliberately independent from `CHECKPOINT_MODEL_VERSION`.
-pub const WCR_FORMAT_VERSION: u32 = 1;
+/// Feature #9 introduces v2 alongside v1 first. The public default writer
+/// remains v1 until v2 compatibility tests are complete.
+pub const WCR_FORMAT_VERSION: u32 = WCR_FORMAT_VERSION_V1;
+
+/// Fixed v2 header size in bytes.
+///
+/// Layout:
+/// - magic:                 8
+/// - format version:        4
+/// - header size:           4
+/// - model version:         4
+/// - architecture:          4
+/// - flags:                 4
+/// - image count:           4
+/// - region count:          4
+/// - payload count:         4
+/// - thread count:          4
+/// - body length:           8
+/// - integrity algorithm:   4
+pub const WCR_V2_HEADER_SIZE: u32 = 60;
+
+/// SHA-256 trailer size.
+pub const WCR_V2_DIGEST_SIZE: usize = 32;
+
+/// Integrity algorithm identifier used by `.wcr` v2.
+pub const WCR_INTEGRITY_SHA256: u32 = 1;
 
 /// No format flags are currently defined.
 pub const WCR_FLAGS_NONE: u32 = 0;

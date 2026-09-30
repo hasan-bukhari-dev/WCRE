@@ -3,9 +3,12 @@
 //! This crate defines WCRE-owned process state. It must not expose Win32,
 //! PSS, HANDLE, CONTEXT, or other operating-system-owned structures.
 //!
-//! Persistent `.wcr` encoding is intentionally not implemented here yet.
-//! First we establish the state model that future encoders and restore
-//! code will consume.
+//! The crate also owns the versioned `.wcr` persistence format used to
+//! serialize and validate platform-independent checkpoint state.
+//!
+//! Persistence and restoration are deliberately separate concerns: a valid
+//! `.wcr` file represents captured state, not proof that execution can yet be
+//! reconstructed or resumed.
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +16,7 @@ mod decode;
 mod encode;
 mod error;
 pub mod format;
+mod integrity;
 
 pub use decode::{read_checkpoint, read_checkpoint_file};
 pub use encode::{write_checkpoint, write_checkpoint_file};
