@@ -1,4 +1,7 @@
+use std::fs;
 use std::io::Cursor;
+
+use tempfile::tempdir;
 
 use crate::{
     Architecture, CheckpointModel, ImageRecord, MemoryKind, MemoryPayload, MemoryProtection,
@@ -165,6 +168,130 @@ fn golden_v1_fixture_decodes_to_expected_checkpoint() {
         read_checkpoint(Cursor::new(golden_v1_bytes())).expect("golden v1 fixture should decode");
 
     assert_eq!(decoded, sample_checkpoint());
+}
+
+#[test]
+fn atomic_v1_file_publication_succeeds_and_decodes() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("checkpoint-v1.wcr");
+    let checkpoint = sample_checkpoint();
+
+    crate::write_checkpoint_file(&checkpoint, &path).expect("atomic v1 publication should succeed");
+
+    let bytes = fs::read(&path).expect("published v1 checkpoint should be readable");
+    let format_version = u32::from_le_bytes(bytes[8..12].try_into().expect("format version"));
+    let decoded =
+        crate::read_checkpoint_file(&path).expect("published v1 checkpoint should decode");
+
+    assert_eq!(format_version, crate::format::WCR_FORMAT_VERSION_V1);
+    assert_eq!(decoded, checkpoint);
+}
+
+#[test]
+fn atomic_v2_file_publication_succeeds_and_decodes() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("checkpoint-v2.wcr");
+    let checkpoint = sample_checkpoint();
+
+    crate::write_checkpoint_v2_file(&checkpoint, &path)
+        .expect("atomic v2 publication should succeed");
+
+    let bytes = fs::read(&path).expect("published v2 checkpoint should be readable");
+    let format_version = u32::from_le_bytes(bytes[8..12].try_into().expect("format version"));
+    let decoded =
+        crate::read_checkpoint_file(&path).expect("published v2 checkpoint should decode");
+
+    assert_eq!(format_version, crate::format::WCR_FORMAT_VERSION_V2);
+    assert_eq!(decoded, checkpoint);
+}
+
+#[test]
+fn atomic_publication_replaces_existing_destination() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("checkpoint.wcr");
+    let checkpoint = sample_checkpoint();
+
+    fs::write(&path, b"existing checkpoint placeholder")
+        .expect("existing destination should be created");
+
+    crate::write_checkpoint_v2_file(&checkpoint, &path)
+        .expect("atomic replacement should succeed on Windows");
+
+    let decoded = crate::read_checkpoint_file(&path).expect("replacement checkpoint should decode");
+    assert_eq!(decoded, checkpoint);
+}
+
+#[test]
+fn existing_destination_survives_failed_atomic_encoding() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("checkpoint.wcr");
+    let checkpoint = sample_checkpoint();
+
+    crate::write_checkpoint_v2_file(&checkpoint, &path)
+        .expect("initial checkpoint publication should succeed");
+
+    let original_bytes = fs::read(&path).expect("initial checkpoint should be readable");
+    let mut invalid = checkpoint.clone();
+    invalid.memory_regions[0].region_size = 0;
+
+    let error = crate::write_checkpoint_v2_file(&invalid, &path)
+        .expect_err("invalid replacement checkpoint must fail");
+
+    assert!(matches!(error, WcrError::InvalidData(_)));
+    assert_eq!(
+        fs::read(&path).expect("existing checkpoint should survive"),
+        original_bytes
+    );
+    assert_eq!(
+        crate::read_checkpoint_file(&path).expect("existing checkpoint should still decode"),
+        checkpoint
+    );
+}
+
+#[test]
+fn failed_atomic_encoding_leaves_no_partial_final_artifact() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("checkpoint.wcr");
+    let mut invalid = sample_checkpoint();
+    invalid.memory_regions[0].region_size = 0;
+
+    let error = crate::write_checkpoint_file(&invalid, &path)
+        .expect_err("invalid checkpoint publication must fail");
+
+    assert!(matches!(error, WcrError::InvalidData(_)));
+    assert!(
+        !path.exists(),
+        "failed publication exposed a final artifact"
+    );
+}
+
+#[test]
+fn atomic_publication_cleans_temporary_artifacts() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("checkpoint.wcr");
+    let mut invalid = sample_checkpoint();
+    invalid.memory_regions[0].region_size = 0;
+
+    crate::write_checkpoint_v2_file(&invalid, &path)
+        .expect_err("invalid checkpoint publication must fail");
+
+    assert_eq!(
+        fs::read_dir(directory.path())
+            .expect("temporary directory should be readable")
+            .count(),
+        0,
+        "failed publication left a temporary artifact"
+    );
+
+    crate::write_checkpoint_v2_file(&sample_checkpoint(), &path)
+        .expect("valid checkpoint publication should succeed");
+
+    let entries: Vec<_> = fs::read_dir(directory.path())
+        .expect("temporary directory should be readable")
+        .map(|entry| entry.expect("directory entry should be readable").path())
+        .collect();
+
+    assert_eq!(entries, vec![path]);
 }
 
 #[test]

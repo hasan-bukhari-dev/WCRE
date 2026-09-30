@@ -1,6 +1,7 @@
-use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
+
+use tempfile::NamedTempFile;
 
 use crate::format::{
     ARCH_ARM32, ARCH_ARM64, ARCH_IA64, ARCH_UNKNOWN_FLAG, ARCH_X64, ARCH_X86, MEMORY_KIND_IMAGE,
@@ -18,6 +19,12 @@ struct RecordCounts {
     regions: u32,
     payloads: u32,
     threads: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CheckpointFileEncoding {
+    Default,
+    V2,
 }
 
 /// Write the current default `.wcr` format.
@@ -107,20 +114,45 @@ pub fn write_checkpoint_file(
     checkpoint: &CheckpointModel,
     path: impl AsRef<Path>,
 ) -> Result<(), WcrError> {
-    let file = File::create(path)?;
-    let writer = BufWriter::new(file);
-
-    write_checkpoint(checkpoint, writer)
+    write_checkpoint_file_atomic(checkpoint, path.as_ref(), CheckpointFileEncoding::Default)
 }
 
 pub fn write_checkpoint_v2_file(
     checkpoint: &CheckpointModel,
     path: impl AsRef<Path>,
 ) -> Result<(), WcrError> {
-    let file = File::create(path)?;
-    let writer = BufWriter::new(file);
+    write_checkpoint_file_atomic(checkpoint, path.as_ref(), CheckpointFileEncoding::V2)
+}
 
-    write_checkpoint_v2(checkpoint, writer)
+fn write_checkpoint_file_atomic(
+    checkpoint: &CheckpointModel,
+    path: &Path,
+    encoding: CheckpointFileEncoding,
+) -> Result<(), WcrError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = NamedTempFile::new_in(parent)?;
+
+    {
+        let mut writer = BufWriter::new(temporary.as_file_mut());
+
+        match encoding {
+            CheckpointFileEncoding::Default => write_checkpoint(checkpoint, &mut writer)?,
+            CheckpointFileEncoding::V2 => write_checkpoint_v2(checkpoint, &mut writer)?,
+        }
+
+        writer.flush()?;
+    }
+
+    temporary.as_file().sync_all()?;
+
+    temporary
+        .persist(path)
+        .map_err(|error| WcrError::Io(error.error))?;
+
+    Ok(())
 }
 
 fn validate_checkpoint_for_encoding(
