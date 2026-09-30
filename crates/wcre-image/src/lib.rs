@@ -17,6 +17,7 @@ mod encode;
 mod error;
 pub mod format;
 mod integrity;
+mod restore_plan;
 
 pub use decode::{read_checkpoint, read_checkpoint_file};
 pub use encode::{
@@ -24,6 +25,10 @@ pub use encode::{
     write_checkpoint_v2, write_checkpoint_v2_file,
 };
 pub use error::WcrError;
+pub use restore_plan::{
+    AddressSpaceOperation, AddressSpacePlan, AddressSpacePlanError, PlannedRegion, SkipReason,
+    SkippedRegion, WINDOWS_X64_ALLOCATION_GRANULARITY, WINDOWS_X64_PAGE_SIZE, plan_address_space,
+};
 
 /// Version of the in-memory WCRE checkpoint model.
 ///
