@@ -102,6 +102,33 @@ fn find_u32(haystack: &[u8], value: u32, occurrence: usize) -> usize {
     find_nth_bytes(haystack, &value.to_le_bytes(), occurrence)
 }
 
+fn sample_v2_bytes() -> Vec<u8> {
+    let checkpoint = sample_checkpoint();
+    let mut bytes = Vec::new();
+
+    crate::write_checkpoint_v2(&checkpoint, &mut bytes).expect("v2 checkpoint should encode");
+
+    bytes
+}
+
+fn resign_v2(bytes: &mut [u8]) {
+    let digest_start = bytes
+        .len()
+        .checked_sub(crate::format::WCR_V2_DIGEST_SIZE)
+        .expect("v2 checkpoint must contain a digest");
+    let digest = crate::integrity::sha256(&bytes[..digest_start]);
+
+    bytes[digest_start..].copy_from_slice(&digest);
+}
+
+fn sample_v2_region_start(bytes: &[u8]) -> usize {
+    let body_start = crate::format::WCR_V2_HEADER_SIZE as usize;
+    let digest_start = bytes.len() - crate::format::WCR_V2_DIGEST_SIZE;
+    let body = &bytes[body_start..digest_start];
+
+    body_start + find_u64(body, 0x0000_0000_1000_0000, 0)
+}
+
 #[test]
 fn checkpoint_round_trips_through_wcr_v1() {
     let original = sample_checkpoint();
@@ -624,4 +651,215 @@ fn dual_reader_still_accepts_v1_checkpoint() {
         read_checkpoint(Cursor::new(bytes)).expect("v1 checkpoint should remain readable");
 
     assert_eq!(decoded, checkpoint);
+}
+
+#[test]
+fn v2_reader_rejects_authenticated_body_length_mismatch() {
+    let mut bytes = sample_v2_bytes();
+    let original_body_length =
+        u64::from_le_bytes(bytes[44..52].try_into().expect("v2 body length"));
+    let digest_start = bytes.len() - crate::format::WCR_V2_DIGEST_SIZE;
+    let declared_body_length = original_body_length + 1;
+
+    bytes.insert(digest_start, 0);
+    bytes[44..52].copy_from_slice(&declared_body_length.to_le_bytes());
+    resign_v2(&mut bytes);
+
+    let error = read_checkpoint(Cursor::new(bytes))
+        .expect_err("authenticated mismatched body length must fail");
+
+    assert!(
+        matches!(
+            error,
+            WcrError::BodyLengthMismatch { declared, consumed }
+                if declared == declared_body_length && consumed == original_body_length
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_trailing_bytes_after_digest() {
+    let mut bytes = sample_v2_bytes();
+    bytes.push(0xA5);
+
+    let error =
+        read_checkpoint(Cursor::new(bytes)).expect_err("trailing bytes after v2 digest must fail");
+
+    assert!(
+        matches!(error, WcrError::InvalidData(_)),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_authenticated_malformed_count() {
+    let mut bytes = sample_v2_bytes();
+    let invalid_count = crate::format::MAX_COLLECTION_ITEMS + 1;
+
+    // Image count occupies bytes 28..32 in the v2 header.
+    bytes[28..32].copy_from_slice(&invalid_count.to_le_bytes());
+    resign_v2(&mut bytes);
+
+    let error = read_checkpoint(Cursor::new(bytes))
+        .expect_err("authenticated oversized image count must fail");
+
+    assert!(
+        matches!(error, WcrError::InvalidData(_)),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_authenticated_nonzero_flags() {
+    let mut bytes = sample_v2_bytes();
+
+    // Flags occupy bytes 24..28 in the v2 header.
+    bytes[24..28].copy_from_slice(&1u32.to_le_bytes());
+    resign_v2(&mut bytes);
+
+    let error =
+        read_checkpoint(Cursor::new(bytes)).expect_err("authenticated nonzero flags must fail");
+
+    assert!(
+        matches!(error, WcrError::InvalidData(_)),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_authenticated_invalid_memory_state() {
+    let mut bytes = sample_v2_bytes();
+    let region_start = sample_v2_region_start(&bytes);
+
+    // Memory-state tag follows three u64 values and allocation protection.
+    bytes[region_start + 28..region_start + 32].copy_from_slice(&0u32.to_le_bytes());
+    resign_v2(&mut bytes);
+
+    let error = read_checkpoint(Cursor::new(bytes))
+        .expect_err("authenticated invalid memory-state encoding must fail");
+
+    assert!(
+        matches!(error, WcrError::InvalidData(_)),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_authenticated_invalid_memory_kind() {
+    let mut bytes = sample_v2_bytes();
+    let region_start = sample_v2_region_start(&bytes);
+
+    // Memory-kind tag follows the memory-state tag/raw pair.
+    bytes[region_start + 36..region_start + 40].copy_from_slice(&0u32.to_le_bytes());
+    resign_v2(&mut bytes);
+
+    let error = read_checkpoint(Cursor::new(bytes))
+        .expect_err("authenticated invalid memory-kind encoding must fail");
+
+    assert!(
+        matches!(error, WcrError::InvalidData(_)),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_authenticated_invalid_boolean() {
+    let mut bytes = sample_v2_bytes();
+    let region_start = sample_v2_region_start(&bytes);
+
+    // The region payload-id presence marker follows protection.
+    bytes[region_start + 48] = 2;
+    resign_v2(&mut bytes);
+
+    let error = read_checkpoint(Cursor::new(bytes))
+        .expect_err("authenticated invalid boolean encoding must fail");
+
+    assert!(
+        matches!(error, WcrError::InvalidBoolean(2)),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_authenticated_malformed_utf8() {
+    let mut bytes = sample_v2_bytes();
+    let body_start = crate::format::WCR_V2_HEADER_SIZE as usize;
+    let digest_start = bytes.len() - crate::format::WCR_V2_DIGEST_SIZE;
+    let image_path = sample_checkpoint().process.image_path;
+    let path_start =
+        body_start + find_nth_bytes(&bytes[body_start..digest_start], image_path.as_bytes(), 0);
+
+    bytes[path_start] = 0xFF;
+    resign_v2(&mut bytes);
+
+    let error =
+        read_checkpoint(Cursor::new(bytes)).expect_err("authenticated malformed UTF-8 must fail");
+
+    assert!(
+        matches!(error, WcrError::InvalidUtf8),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_authenticated_oversized_string_length() {
+    let mut bytes = sample_v2_bytes();
+    let body_start = crate::format::WCR_V2_HEADER_SIZE as usize;
+    let digest_start = bytes.len() - crate::format::WCR_V2_DIGEST_SIZE;
+    let image_path = sample_checkpoint().process.image_path;
+    let path_start =
+        body_start + find_nth_bytes(&bytes[body_start..digest_start], image_path.as_bytes(), 0);
+    let invalid_length = crate::format::MAX_STRING_BYTES + 1;
+
+    bytes[path_start - 4..path_start].copy_from_slice(&invalid_length.to_le_bytes());
+    resign_v2(&mut bytes);
+
+    let error = read_checkpoint(Cursor::new(bytes))
+        .expect_err("authenticated oversized string length must fail");
+
+    assert!(
+        matches!(error, WcrError::InvalidData(_)),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_authenticated_oversized_payload_length() {
+    let mut bytes = sample_v2_bytes();
+    let body_start = crate::format::WCR_V2_HEADER_SIZE as usize;
+    let digest_start = bytes.len() - crate::format::WCR_V2_DIGEST_SIZE;
+    let payload_bytes = [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
+    let payload_start =
+        body_start + find_nth_bytes(&bytes[body_start..digest_start], &payload_bytes, 0);
+    let invalid_length = crate::format::MAX_SINGLE_PAYLOAD_BYTES + 1;
+
+    bytes[payload_start - 8..payload_start].copy_from_slice(&invalid_length.to_le_bytes());
+    resign_v2(&mut bytes);
+
+    let error = read_checkpoint(Cursor::new(bytes))
+        .expect_err("authenticated oversized payload length must fail");
+
+    assert!(
+        matches!(error, WcrError::InvalidData(_)),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn v2_reader_rejects_authenticated_semantically_invalid_body() {
+    let mut bytes = sample_v2_bytes();
+    let region_start = sample_v2_region_start(&bytes);
+
+    // Zero-sized regions are structurally decodable but semantically invalid.
+    bytes[region_start + 16..region_start + 24].copy_from_slice(&0u64.to_le_bytes());
+    resign_v2(&mut bytes);
+
+    let error = read_checkpoint(Cursor::new(bytes))
+        .expect_err("authenticated semantically invalid checkpoint must fail");
+
+    assert!(
+        matches!(error, WcrError::InvalidData(_)),
+        "unexpected error: {error:?}"
+    );
 }
