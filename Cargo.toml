@@ -1,7 +1,9 @@
-[workspace]
+﻿[workspace]
 resolver = "2"
 
 members = [
     "crates/wcre-cli",
-    "crates/wcre-win32", "tests/targets/native-x64",
+    "crates/wcre-image",
+    "crates/wcre-win32",
+    "tests/targets/native-x64",
 ]

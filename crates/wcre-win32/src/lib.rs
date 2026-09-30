@@ -22,9 +22,10 @@ pub use memory_read::{
 pub use process::{ProcessArchitecture, ProcessInfo, inspect_process};
 
 pub use snapshot::{
-    SnapshotMemoryComparison, SnapshotPrivateDiff, SnapshotPrivateRegionChange,
-    SnapshotProbeReport, SnapshotThread, SnapshotThreadReport, SnapshotU64Read, VaCloneSnapshot,
-    X64RegisterContext, capture_snapshot_probe, capture_thread_contexts,
+    SnapshotImage, SnapshotImageReport, SnapshotMemoryComparison, SnapshotPrivateDiff,
+    SnapshotPrivateRegionChange, SnapshotProbeReport, SnapshotThread, SnapshotThreadReport,
+    SnapshotU64Read, VaCloneSnapshot, X64RegisterContext, capture_checkpoint_model,
+    capture_image_inventory, capture_snapshot_probe, capture_thread_contexts,
     capture_thread_state_validation, capture_va_clone, compare_va_clone_memory,
     diff_va_clone_private_memory,
 };
