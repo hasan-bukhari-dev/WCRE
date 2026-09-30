@@ -1,7 +1,7 @@
 use std::env;
 use std::process::ExitCode;
 
-use wcre_image::{read_checkpoint_file, write_checkpoint_file};
+use wcre_image::{read_checkpoint_file, write_checkpoint_v1_file, write_checkpoint_v2_file};
 
 use wcre_win32::{
     MemoryTypeReadSummary, capture_checkpoint_model, capture_image_inventory,
@@ -9,6 +9,21 @@ use wcre_win32::{
     capture_va_clone, compare_va_clone_memory, diff_va_clone_private_memory, inspect_process,
     query_memory_map, read_process_memory,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointFormat {
+    V1,
+    V2,
+}
+
+impl CheckpointFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -46,8 +61,8 @@ fn run() -> Result<(), String> {
         }
 
         Some("checkpoint") => {
-            let (pid, output) = parse_checkpoint_arguments(args.collect())?;
-            run_checkpoint(pid, &output)
+            let (pid, output, format) = parse_checkpoint_arguments(args.collect())?;
+            run_checkpoint(pid, &output, format)
         }
 
         Some("inspect-checkpoint") => {
@@ -232,9 +247,12 @@ fn run_snapshot(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_checkpoint_arguments(args: Vec<String>) -> Result<(u32, String), String> {
+fn parse_checkpoint_arguments(
+    args: Vec<String>,
+) -> Result<(u32, String, CheckpointFormat), String> {
     let mut pid = None;
     let mut output = None;
+    let mut format = None;
 
     let mut args = args.into_iter();
 
@@ -264,10 +282,31 @@ fn parse_checkpoint_arguments(args: Vec<String>) -> Result<(u32, String), String
                 }
             }
 
+            "--format" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing value after --format".to_string())?;
+
+                let value = match value.as_str() {
+                    "v1" => CheckpointFormat::V1,
+                    "v2" => CheckpointFormat::V2,
+                    other => {
+                        return Err(format!(
+                            "unsupported checkpoint format '{other}'; expected v1 or v2"
+                        ));
+                    }
+                };
+
+                if format.replace(value).is_some() {
+                    return Err("--format may only be specified once".to_string());
+                }
+            }
+
             other => {
                 return Err(format!(
                     "unexpected argument '{other}'\n\
-                     usage: wcre-cli checkpoint --pid <PID> --output <FILE.wcr>"
+                     usage: wcre-cli checkpoint --pid <PID> --output <FILE.wcr> \
+                     [--format <v1|v2>]"
                 ));
             }
         }
@@ -276,8 +315,9 @@ fn parse_checkpoint_arguments(args: Vec<String>) -> Result<(u32, String), String
     let pid = pid.ok_or_else(|| "missing required --pid argument".to_string())?;
 
     let output = output.ok_or_else(|| "missing required --output argument".to_string())?;
+    let format = format.unwrap_or(CheckpointFormat::V2);
 
-    Ok((pid, output))
+    Ok((pid, output, format))
 }
 
 fn parse_inspect_checkpoint_arguments(args: Vec<String>) -> Result<(String, Vec<u64>), String> {
@@ -326,7 +366,7 @@ fn parse_inspect_checkpoint_arguments(args: Vec<String>) -> Result<(String, Vec<
     Ok((path, addresses))
 }
 
-fn run_checkpoint(pid: u32, output: &str) -> Result<(), String> {
+fn run_checkpoint(pid: u32, output: &str, format: CheckpointFormat) -> Result<(), String> {
     let checkpoint = capture_checkpoint_model(pid).map_err(|error| {
         format!("failed to capture WCRE checkpoint model for PID {pid}: {error}")
     })?;
@@ -342,8 +382,16 @@ fn run_checkpoint(pid: u32, output: &str) -> Result<(), String> {
         return Err("checkpoint model failed memory-payload integrity checks".to_string());
     }
 
-    write_checkpoint_file(&checkpoint, output)
-        .map_err(|error| format!("failed to write '{output}': {error}"))?;
+    match format {
+        CheckpointFormat::V1 => write_checkpoint_v1_file(&checkpoint, output),
+        CheckpointFormat::V2 => write_checkpoint_v2_file(&checkpoint, output),
+    }
+    .map_err(|error| {
+        format!(
+            "failed to write {} checkpoint '{output}': {error}",
+            format.label()
+        )
+    })?;
 
     let file_size = std::fs::metadata(output)
         .map_err(|error| format!("failed to stat '{output}': {error}"))?
@@ -353,6 +401,7 @@ fn run_checkpoint(pid: u32, output: &str) -> Result<(), String> {
     println!();
     println!("{:<24}{}", "Source PID:", pid);
     println!("{:<24}{}", "Output:", output);
+    println!("{:<24}{}", "Format:", format.label());
     println!(
         "{:<24}{}",
         "Architecture:",
@@ -1326,11 +1375,96 @@ fn print_help() {
     println!("  wcre-cli memory-map --pid <PID>");
     println!("  wcre-cli memory-read --pid <PID>");
     println!("  wcre-cli snapshot --pid <PID>");
-    println!("  wcre-cli checkpoint --pid <PID> --output <FILE.wcr>");
+    println!("  wcre-cli checkpoint --pid <PID> --output <FILE.wcr> [--format <v1|v2>]");
     println!("  wcre-cli inspect-checkpoint <FILE.wcr> [--address <HEX> ...]");
     println!("  wcre-cli checkpoint-model --pid <PID>");
     println!("  wcre-cli snapshot-images --pid <PID>");
     println!("  wcre-cli snapshot-threads --pid <PID>");
     println!("  wcre-cli snapshot-verify --pid <PID>");
     println!("  wcre-cli snapshot-private-diff --pid <PID>");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn checkpoint_arguments_default_to_v2() {
+        let (pid, output, format) =
+            parse_checkpoint_arguments(strings(&["--pid", "4242", "--output", "checkpoint.wcr"]))
+                .expect("default checkpoint arguments should parse");
+
+        assert_eq!(pid, 4242);
+        assert_eq!(output, "checkpoint.wcr");
+        assert_eq!(format, CheckpointFormat::V2);
+    }
+
+    #[test]
+    fn checkpoint_arguments_accept_explicit_v1() {
+        let (_, _, format) = parse_checkpoint_arguments(strings(&[
+            "--format",
+            "v1",
+            "--pid",
+            "4242",
+            "--output",
+            "checkpoint.wcr",
+        ]))
+        .expect("explicit v1 checkpoint arguments should parse");
+
+        assert_eq!(format, CheckpointFormat::V1);
+    }
+
+    #[test]
+    fn checkpoint_arguments_accept_explicit_v2() {
+        let (_, _, format) = parse_checkpoint_arguments(strings(&[
+            "--pid",
+            "4242",
+            "--output",
+            "checkpoint.wcr",
+            "--format",
+            "v2",
+        ]))
+        .expect("explicit v2 checkpoint arguments should parse");
+
+        assert_eq!(format, CheckpointFormat::V2);
+    }
+
+    #[test]
+    fn checkpoint_arguments_reject_unknown_format() {
+        let error = parse_checkpoint_arguments(strings(&[
+            "--pid",
+            "4242",
+            "--output",
+            "checkpoint.wcr",
+            "--format",
+            "v3",
+        ]))
+        .expect_err("unknown checkpoint format must fail");
+
+        assert!(
+            error.contains("expected v1 or v2"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_arguments_reject_duplicate_format() {
+        let error = parse_checkpoint_arguments(strings(&[
+            "--pid",
+            "4242",
+            "--output",
+            "checkpoint.wcr",
+            "--format",
+            "v1",
+            "--format",
+            "v2",
+        ]))
+        .expect_err("duplicate checkpoint format must fail");
+
+        assert_eq!(error, "--format may only be specified once");
+    }
 }

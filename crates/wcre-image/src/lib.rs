@@ -1,11 +1,14 @@
-﻿//! Platform-independent checkpoint representation for WCRE.
+//! Platform-independent checkpoint representation for WCRE.
 //!
 //! This crate defines WCRE-owned process state. It must not expose Win32,
 //! PSS, HANDLE, CONTEXT, or other operating-system-owned structures.
 //!
-//! Persistent `.wcr` encoding is intentionally not implemented here yet.
-//! First we establish the state model that future encoders and restore
-//! code will consume.
+//! The crate also owns the versioned `.wcr` persistence format used to
+//! serialize and validate platform-independent checkpoint state.
+//!
+//! Persistence and restoration are deliberately separate concerns: a valid
+//! `.wcr` file represents captured state, not proof that execution can yet be
+//! reconstructed or resumed.
 
 #![forbid(unsafe_code)]
 
@@ -13,9 +16,13 @@ mod decode;
 mod encode;
 mod error;
 pub mod format;
+mod integrity;
 
 pub use decode::{read_checkpoint, read_checkpoint_file};
-pub use encode::{write_checkpoint, write_checkpoint_file};
+pub use encode::{
+    write_checkpoint, write_checkpoint_file, write_checkpoint_v1, write_checkpoint_v1_file,
+    write_checkpoint_v2, write_checkpoint_v2_file,
+};
 pub use error::WcrError;
 
 /// Version of the in-memory WCRE checkpoint model.
@@ -212,15 +219,18 @@ impl CheckpointModel {
             .iter()
             .filter_map(|region| {
                 region.payload_id.map(|payload_id| {
-                    let matches: Vec<_> = self
+                    let mut matches = self
                         .payloads
                         .iter()
-                        .filter(|payload| payload.id == payload_id)
-                        .collect();
+                        .filter(|payload| payload.id == payload_id);
 
-                    matches.len() == 1
-                        && matches[0].base_address == region.base_address
-                        && matches[0].bytes.len() as u64 == region.region_size
+                    let Some(payload) = matches.next() else {
+                        return false;
+                    };
+
+                    matches.next().is_none()
+                        && payload.base_address == region.base_address
+                        && payload.bytes.len() as u64 == region.region_size
                 })
             })
             .all(|valid| valid)
@@ -251,6 +261,83 @@ impl CheckpointModel {
             .iter()
             .map(|payload| payload.bytes.len() as u64)
             .sum()
+    }
+
+    /// Validate structural and semantic relationships required for a
+    /// meaningful WCRE checkpoint model.
+    pub fn validate_semantics(&self) -> Result<(), WcrError> {
+        if !self.payload_links_valid() {
+            return Err(WcrError::InvalidData(
+                "checkpoint contains invalid payload links",
+            ));
+        }
+
+        if !self.payload_ids_unique() {
+            return Err(WcrError::InvalidData(
+                "checkpoint contains duplicate payload IDs",
+            ));
+        }
+
+        if !self.every_payload_referenced_once() {
+            return Err(WcrError::InvalidData(
+                "checkpoint contains unreferenced or multiply-referenced payloads",
+            ));
+        }
+
+        for region in &self.memory_regions {
+            if region.region_size == 0 {
+                return Err(WcrError::InvalidData(
+                    "checkpoint contains zero-sized memory region",
+                ));
+            }
+
+            if region
+                .base_address
+                .checked_add(region.region_size)
+                .is_none()
+            {
+                return Err(WcrError::InvalidData(
+                    "checkpoint contains overflowing memory-region range",
+                ));
+            }
+        }
+
+        for payload in &self.payloads {
+            let payload_length = u64::try_from(payload.bytes.len())
+                .map_err(|_| WcrError::ValueOutOfRange("payload byte length"))?;
+
+            if payload.base_address.checked_add(payload_length).is_none() {
+                return Err(WcrError::InvalidData(
+                    "checkpoint contains overflowing payload range",
+                ));
+            }
+        }
+
+        for thread in &self.threads {
+            if thread.process_id != self.process.captured_pid {
+                return Err(WcrError::InvalidData(
+                    "checkpoint thread PID does not match captured process PID",
+                ));
+            }
+
+            if let (Some(stack_base), Some(stack_limit)) = (thread.stack_base, thread.stack_limit) {
+                if stack_limit >= stack_base {
+                    return Err(WcrError::InvalidData(
+                        "checkpoint contains invalid thread stack bounds",
+                    ));
+                }
+
+                if let Some(context) = &thread.context {
+                    if context.rsp < stack_limit || context.rsp >= stack_base {
+                        return Err(WcrError::InvalidData(
+                            "checkpoint RSP lies outside captured thread stack",
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
     pub fn new(process: ProcessRecord) -> Self {
         Self {

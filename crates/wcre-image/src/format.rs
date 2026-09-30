@@ -3,25 +3,37 @@
 /// ASCII: "WCREWCR\0"
 pub const WCR_MAGIC: [u8; 8] = *b"WCREWCR\0";
 
-/// Version of the persistent `.wcr` binary format.
-///
-/// This is deliberately independent from `CHECKPOINT_MODEL_VERSION`.
-pub const WCR_FORMAT_VERSION: u32 = 1;
+/// Original persistent `.wcr` binary format.
+pub const WCR_FORMAT_VERSION_V1: u32 = 1;
 
-/// Current fixed header size in bytes.
+/// Integrity-protected `.wcr` format.
+pub const WCR_FORMAT_VERSION_V2: u32 = 2;
+
+/// Current format emitted by the default writer.
+pub const WCR_FORMAT_VERSION: u32 = WCR_FORMAT_VERSION_V2;
+
+/// Fixed v2 header size in bytes.
 ///
 /// Layout:
-///
-/// - magic:              8 bytes
-/// - format_version:     4 bytes
-/// - model_version:      4 bytes
-/// - architecture:       4 bytes
-/// - flags:              4 bytes
-/// - image_count:        4 bytes
-/// - region_count:       4 bytes
-/// - payload_count:      4 bytes
-/// - thread_count:       4 bytes
-pub const WCR_HEADER_SIZE: u32 = 40;
+/// - magic:                 8
+/// - format version:        4
+/// - header size:           4
+/// - model version:         4
+/// - architecture:          4
+/// - flags:                 4
+/// - image count:           4
+/// - region count:          4
+/// - payload count:         4
+/// - thread count:          4
+/// - body length:           8
+/// - integrity algorithm:   4
+pub const WCR_V2_HEADER_SIZE: u32 = 56;
+
+/// SHA-256 trailer size.
+pub const WCR_V2_DIGEST_SIZE: usize = 32;
+
+/// Integrity algorithm identifier used by `.wcr` v2.
+pub const WCR_INTEGRITY_SHA256: u32 = 1;
 
 /// No format flags are currently defined.
 pub const WCR_FLAGS_NONE: u32 = 0;
@@ -47,10 +59,16 @@ pub const MEMORY_KIND_IMAGE: u32 = 3;
 pub const MEMORY_KIND_NONE: u32 = 4;
 pub const MEMORY_KIND_UNKNOWN: u32 = 0xFFFF_FFFF;
 
-/// Defensive limits for the v1 decoder.
+/// Defensive limits for the v1 and v2 decoders.
 ///
 /// These are format-parser safety limits, not statements about the final
 /// supported WCRE workload envelope.
 pub const MAX_COLLECTION_ITEMS: u32 = 1_000_000;
 pub const MAX_STRING_BYTES: u32 = 16 * 1024 * 1024;
 pub const MAX_SINGLE_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Maximum cumulative payload bytes accepted by the v1 and v2 decoders.
+///
+/// This is a parser-safety budget rather than a statement about the
+/// eventual WCRE workload or migration envelope.
+pub const MAX_TOTAL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
