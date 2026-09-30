@@ -1,4 +1,4 @@
-//! Platform-independent checkpoint representation for WCRE.
+﻿//! Platform-independent checkpoint representation for WCRE.
 //!
 //! This crate defines WCRE-owned process state. It must not expose Win32,
 //! PSS, HANDLE, CONTEXT, or other operating-system-owned structures.
@@ -8,6 +8,15 @@
 //! code will consume.
 
 #![forbid(unsafe_code)]
+
+mod decode;
+mod encode;
+mod error;
+pub mod format;
+
+pub use decode::{read_checkpoint, read_checkpoint_file};
+pub use encode::{write_checkpoint, write_checkpoint_file};
+pub use error::WcrError;
 
 /// Version of the in-memory WCRE checkpoint model.
 ///
@@ -370,3 +379,6 @@ mod tests {
         assert!(!checkpoint.payload_ids_unique());
     }
 }
+
+#[cfg(test)]
+mod codec_tests;
