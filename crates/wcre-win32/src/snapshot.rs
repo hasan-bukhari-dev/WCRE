@@ -4,10 +4,13 @@ use std::mem::size_of;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_ALL_AMD64, ReadProcessMemory};
 use windows::Win32::System::Diagnostics::ProcessSnapshotting::{
-    HPSS, HPSSWALK, PSS_CAPTURE_THREAD_CONTEXT, PSS_CAPTURE_THREADS, PSS_CAPTURE_VA_CLONE,
-    PSS_QUERY_VA_CLONE_INFORMATION, PSS_THREAD_ENTRY, PSS_VA_CLONE_INFORMATION, PSS_WALK_THREADS,
-    PssCaptureSnapshot, PssFreeSnapshot, PssQuerySnapshot, PssWalkMarkerCreate, PssWalkMarkerFree,
-    PssWalkSnapshot,
+    HPSS, HPSSWALK, PSS_CAPTURE_FLAGS, PSS_CAPTURE_THREAD_CONTEXT, PSS_CAPTURE_THREADS,
+    PSS_CAPTURE_VA_CLONE, PSS_QUERY_VA_CLONE_INFORMATION, PSS_THREAD_ENTRY,
+    PSS_VA_CLONE_INFORMATION, PSS_WALK_THREADS, PssCaptureSnapshot, PssFreeSnapshot,
+    PssQuerySnapshot, PssWalkMarkerCreate, PssWalkMarkerFree, PssWalkSnapshot,
+};
+use windows::Win32::System::Memory::{
+    PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetProcessId, PROCESS_CREATE_PROCESS, PROCESS_QUERY_INFORMATION,
@@ -15,7 +18,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{Error, HRESULT};
 
-use crate::memory::{MemoryProtection, MemoryState, MemoryType, query_memory_map_handle};
+use crate::memory::{
+    MemoryProtection, MemoryRegion, MemoryState, MemoryType, query_memory_map_handle,
+};
 use crate::memory_read::{MemoryReadReport, is_readable_protection, read_process_memory_handle};
 use crate::process::open_process;
 
@@ -53,25 +58,26 @@ impl Drop for VaCloneSnapshot {
     }
 }
 
-/// Capture a PSS virtual-address clone of a live process.
-pub fn capture_va_clone(pid: u32) -> windows::core::Result<VaCloneSnapshot> {
+fn capture_snapshot(
+    pid: u32,
+    capture_flags: PSS_CAPTURE_FLAGS,
+    context_flags: Option<u32>,
+) -> windows::core::Result<VaCloneSnapshot> {
     let access = PROCESS_CREATE_PROCESS | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ;
 
     let process = open_process(pid, access)?;
 
     let mut snapshot_handle = HPSS::default();
 
-    let capture_flags = PSS_CAPTURE_VA_CLONE | PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT;
-
     // SAFETY:
     // - process is a valid process handle.
     // - snapshot_handle points to writable HPSS storage.
-    // - the thread-context flags request the standard x64 CONTEXT groups.
+    // - context_flags corresponds to the requested capture policy.
     let result = unsafe {
         PssCaptureSnapshot(
             process.raw(),
             capture_flags,
-            Some(CONTEXT_ALL_AMD64.0),
+            context_flags,
             &mut snapshot_handle,
         )
     };
@@ -115,6 +121,19 @@ pub fn capture_va_clone(pid: u32) -> windows::core::Result<VaCloneSnapshot> {
     })
 }
 
+/// Capture only a PSS virtual-address clone of a live process.
+pub fn capture_va_clone(pid: u32) -> windows::core::Result<VaCloneSnapshot> {
+    capture_snapshot(pid, PSS_CAPTURE_VA_CLONE, None)
+}
+
+/// Capture a PSS VA clone together with thread inventory and x64 contexts.
+fn capture_va_clone_with_threads(pid: u32) -> windows::core::Result<VaCloneSnapshot> {
+    capture_snapshot(
+        pid,
+        PSS_CAPTURE_VA_CLONE | PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT,
+        Some(CONTEXT_ALL_AMD64.0),
+    )
+}
 #[derive(Debug, Clone)]
 pub struct SnapshotMemoryComparison {
     pub source_pid: u32,
@@ -367,7 +386,7 @@ fn walk_snapshot_threads(snapshot_handle: HPSS) -> windows::core::Result<Vec<Sna
 }
 
 pub fn capture_thread_contexts(pid: u32) -> windows::core::Result<SnapshotThreadReport> {
-    let snapshot = capture_va_clone(pid)?;
+    let snapshot = capture_va_clone_with_threads(pid)?;
     let threads = walk_snapshot_threads(snapshot.snapshot_handle)?;
 
     Ok(SnapshotThreadReport {
@@ -377,6 +396,346 @@ pub fn capture_thread_contexts(pid: u32) -> windows::core::Result<SnapshotThread
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct SnapshotU64Read {
+    pub address: usize,
+    pub bytes_read: usize,
+    pub value: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotProbeReport {
+    pub source_pid: u32,
+    pub clone_pid: u32,
+    pub threads: Vec<SnapshotThread>,
+    pub reads: Vec<SnapshotU64Read>,
+}
+
+/// Capture thread state and exact 64-bit memory values from one PSS snapshot.
+///
+/// This is a research primitive for correlating CPU state with known memory
+/// state. Every thread record and every memory read in the returned report
+/// comes from the same PSS snapshot.
+pub fn capture_snapshot_probe(
+    pid: u32,
+    addresses: &[usize],
+) -> windows::core::Result<SnapshotProbeReport> {
+    let snapshot = capture_va_clone_with_threads(pid)?;
+    let threads = walk_snapshot_threads(snapshot.snapshot_handle)?;
+
+    let mut reads = Vec::with_capacity(addresses.len());
+
+    for &address in addresses {
+        let mut bytes = [0u8; 8];
+        let mut bytes_read = 0usize;
+
+        // SAFETY:
+        // - clone_handle is a valid PSS VA-clone process handle.
+        // - address is used only as a remote-process source address.
+        // - bytes is valid writable storage for exactly eight bytes.
+        let result = unsafe {
+            ReadProcessMemory(
+                snapshot.clone_handle(),
+                address as *const c_void,
+                bytes.as_mut_ptr() as *mut c_void,
+                bytes.len(),
+                Some(&mut bytes_read),
+            )
+        };
+
+        let error = result.err().map(|error| error.to_string());
+
+        let value = if error.is_none() && bytes_read == bytes.len() {
+            Some(u64::from_le_bytes(bytes))
+        } else {
+            None
+        };
+
+        reads.push(SnapshotU64Read {
+            address,
+            bytes_read,
+            value,
+            error,
+        });
+    }
+
+    Ok(SnapshotProbeReport {
+        source_pid: snapshot.source_pid(),
+        clone_pid: snapshot.clone_pid(),
+        threads,
+        reads,
+    })
+}
+const X64_TEB_STACK_BASE_OFFSET: usize = 0x08;
+const X64_TEB_STACK_LIMIT_OFFSET: usize = 0x10;
+const X64_TEB_SELF_OFFSET: usize = 0x30;
+
+#[derive(Debug, Clone)]
+pub struct SnapshotThreadValidation {
+    pub process_id: u32,
+    pub thread_id: u32,
+
+    pub teb_base_address: usize,
+    pub teb_self: Option<usize>,
+
+    pub stack_base: Option<usize>,
+    pub stack_limit: Option<usize>,
+
+    pub rip: usize,
+    pub rsp: usize,
+    pub rbp: usize,
+
+    pub rip_region: Option<MemoryRegion>,
+    pub rsp_region: Option<MemoryRegion>,
+
+    pub teb_self_valid: bool,
+    pub stack_bounds_valid: bool,
+    pub rsp_in_reported_stack: bool,
+    pub rip_in_committed_executable_image: bool,
+    pub rsp_in_committed_private: bool,
+}
+
+impl SnapshotThreadValidation {
+    pub fn stack_metadata_complete(&self) -> bool {
+        self.teb_self.is_some() && self.stack_base.is_some() && self.stack_limit.is_some()
+    }
+
+    pub fn valid(&self) -> bool {
+        self.stack_metadata_complete()
+            && self.teb_self_valid
+            && self.stack_bounds_valid
+            && self.rsp_in_reported_stack
+            && self.rip_in_committed_executable_image
+            && self.rsp_in_committed_private
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotThreadValidationReport {
+    pub source_pid: u32,
+    pub clone_pid: u32,
+    pub live_threads: usize,
+    pub validations: Vec<SnapshotThreadValidation>,
+}
+
+impl SnapshotThreadValidationReport {
+    pub fn missing_contexts(&self) -> usize {
+        self.live_threads.saturating_sub(self.validations.len())
+    }
+
+    pub fn all_valid(&self) -> bool {
+        self.live_threads > 0
+            && self.missing_contexts() == 0
+            && self.validations.iter().all(SnapshotThreadValidation::valid)
+    }
+}
+
+fn snapshot_read_u64(handle: HANDLE, address: usize) -> Option<u64> {
+    let mut bytes = [0u8; 8];
+    let mut bytes_read = 0usize;
+
+    // SAFETY:
+    // - handle is a valid process handle for the PSS VA clone.
+    // - address is used only as a remote source address.
+    // - bytes is writable storage for exactly eight bytes.
+    let result = unsafe {
+        ReadProcessMemory(
+            handle,
+            address as *const c_void,
+            bytes.as_mut_ptr() as *mut c_void,
+            bytes.len(),
+            Some(&mut bytes_read),
+        )
+    };
+
+    if result.is_ok() && bytes_read == bytes.len() {
+        Some(u64::from_le_bytes(bytes))
+    } else {
+        None
+    }
+}
+
+fn memory_region_containing(regions: &[MemoryRegion], address: usize) -> Option<MemoryRegion> {
+    regions
+        .iter()
+        .find(|region| address >= region.base_address && address < region.end_address())
+        .cloned()
+}
+
+fn is_executable_protection(protection: MemoryProtection) -> bool {
+    let base = protection.0 & 0xFF;
+
+    base == PAGE_EXECUTE.0
+        || base == PAGE_EXECUTE_READ.0
+        || base == PAGE_EXECUTE_READWRITE.0
+        || base == PAGE_EXECUTE_WRITECOPY.0
+}
+
+fn address_inside_reported_stack(stack_limit: usize, stack_base: usize, address: usize) -> bool {
+    stack_limit <= address && address < stack_base
+}
+
+/// Capture live thread CPU state and validate it against TEB and memory-map
+/// state from the same PSS snapshot.
+pub fn capture_thread_state_validation(
+    pid: u32,
+) -> windows::core::Result<SnapshotThreadValidationReport> {
+    let snapshot = capture_va_clone_with_threads(pid)?;
+
+    let threads = walk_snapshot_threads(snapshot.snapshot_handle)?;
+    let map = query_memory_map_handle(snapshot.clone_handle())?;
+
+    let live_threads = threads.iter().filter(|thread| !thread.terminated).count();
+
+    let mut validations = Vec::new();
+
+    for thread in threads.iter().filter(|thread| !thread.terminated) {
+        let Some(context) = &thread.context else {
+            continue;
+        };
+
+        let teb = thread.teb_base_address;
+
+        let stack_base = teb
+            .checked_add(X64_TEB_STACK_BASE_OFFSET)
+            .and_then(|address| snapshot_read_u64(snapshot.clone_handle(), address))
+            .map(|value| value as usize);
+
+        let stack_limit = teb
+            .checked_add(X64_TEB_STACK_LIMIT_OFFSET)
+            .and_then(|address| snapshot_read_u64(snapshot.clone_handle(), address))
+            .map(|value| value as usize);
+
+        let teb_self = teb
+            .checked_add(X64_TEB_SELF_OFFSET)
+            .and_then(|address| snapshot_read_u64(snapshot.clone_handle(), address))
+            .map(|value| value as usize);
+
+        let rip = context.rip as usize;
+        let rsp = context.rsp as usize;
+        let rbp = context.rbp as usize;
+
+        let rip_region = memory_region_containing(&map.regions, rip);
+        let rsp_region = memory_region_containing(&map.regions, rsp);
+
+        let teb_self_valid = teb_self == Some(teb);
+
+        let stack_bounds_valid = match (stack_limit, stack_base) {
+            (Some(limit), Some(base)) => limit < base,
+            _ => false,
+        };
+
+        let rsp_in_reported_stack = match (stack_limit, stack_base) {
+            (Some(limit), Some(base)) => address_inside_reported_stack(limit, base, rsp),
+            _ => false,
+        };
+
+        let rip_in_committed_executable_image = rip_region
+            .as_ref()
+            .map(|region| {
+                region.state == MemoryState::Commit
+                    && region.kind == MemoryType::Image
+                    && is_executable_protection(region.protection)
+            })
+            .unwrap_or(false);
+
+        let rsp_in_committed_private = rsp_region
+            .as_ref()
+            .map(|region| region.state == MemoryState::Commit && region.kind == MemoryType::Private)
+            .unwrap_or(false);
+
+        validations.push(SnapshotThreadValidation {
+            process_id: thread.process_id,
+            thread_id: thread.thread_id,
+
+            teb_base_address: teb,
+            teb_self,
+
+            stack_base,
+            stack_limit,
+
+            rip,
+            rsp,
+            rbp,
+
+            rip_region,
+            rsp_region,
+
+            teb_self_valid,
+            stack_bounds_valid,
+            rsp_in_reported_stack,
+            rip_in_committed_executable_image,
+            rsp_in_committed_private,
+        });
+    }
+
+    validations.sort_by_key(|validation| validation.thread_id);
+
+    Ok(SnapshotThreadValidationReport {
+        source_pid: snapshot.source_pid(),
+        clone_pid: snapshot.clone_pid(),
+        live_threads,
+        validations,
+    })
+}
+#[cfg(test)]
+mod thread_validation_tests {
+    use super::*;
+    use windows::Win32::System::Memory::PAGE_READWRITE;
+
+    #[test]
+    fn reported_stack_range_is_half_open() {
+        let limit = 0x1000usize;
+        let base = 0x5000usize;
+
+        assert!(address_inside_reported_stack(limit, base, 0x1000));
+        assert!(address_inside_reported_stack(limit, base, 0x3000));
+        assert!(address_inside_reported_stack(limit, base, 0x4FFF));
+
+        assert!(!address_inside_reported_stack(limit, base, 0x0FFF));
+        assert!(!address_inside_reported_stack(limit, base, 0x5000));
+    }
+
+    #[test]
+    fn executable_protection_detection_accepts_execute_pages() {
+        assert!(is_executable_protection(MemoryProtection(PAGE_EXECUTE.0)));
+        assert!(is_executable_protection(MemoryProtection(
+            PAGE_EXECUTE_READ.0
+        )));
+        assert!(is_executable_protection(MemoryProtection(
+            PAGE_EXECUTE_READWRITE.0
+        )));
+        assert!(is_executable_protection(MemoryProtection(
+            PAGE_EXECUTE_WRITECOPY.0
+        )));
+
+        assert!(!is_executable_protection(MemoryProtection(
+            PAGE_READWRITE.0
+        )));
+    }
+
+    #[test]
+    fn memory_region_lookup_respects_region_boundaries() {
+        let region = MemoryRegion {
+            base_address: 0x2000,
+            allocation_base: 0x2000,
+            region_size: 0x1000,
+            allocation_protection: MemoryProtection(PAGE_READWRITE.0),
+            state: MemoryState::Commit,
+            kind: MemoryType::Private,
+            protection: MemoryProtection(PAGE_READWRITE.0),
+        };
+
+        let regions = vec![region];
+
+        assert!(memory_region_containing(&regions, 0x2000).is_some());
+        assert!(memory_region_containing(&regions, 0x2FFF).is_some());
+
+        assert!(memory_region_containing(&regions, 0x1FFF).is_none());
+        assert!(memory_region_containing(&regions, 0x3000).is_none());
+    }
+}
 /// Windows x64 shared user-mode data page.
 ///
 /// Microsoft documents KUSER_SHARED_DATA at 0x7FFE0000. It contains
