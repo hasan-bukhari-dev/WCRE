@@ -102,6 +102,13 @@ fn find_u32(haystack: &[u8], value: u32, occurrence: usize) -> usize {
     find_nth_bytes(haystack, &value.to_le_bytes(), occurrence)
 }
 
+fn golden_v1_bytes() -> Vec<u8> {
+    include_str!("testdata/sample-v1.hex")
+        .split_ascii_whitespace()
+        .map(|byte| u8::from_str_radix(byte, 16).expect("golden v1 fixture must contain hex bytes"))
+        .collect()
+}
+
 fn sample_v2_bytes() -> Vec<u8> {
     let checkpoint = sample_checkpoint();
     let mut bytes = Vec::new();
@@ -140,6 +147,24 @@ fn checkpoint_round_trips_through_wcr_v1() {
     let decoded = read_checkpoint(Cursor::new(bytes)).expect("encoded checkpoint should decode");
 
     assert_eq!(decoded, original);
+}
+
+#[test]
+fn v1_writer_matches_golden_fixture_exactly() {
+    let checkpoint = sample_checkpoint();
+    let mut encoded = Vec::new();
+
+    write_checkpoint(&checkpoint, &mut encoded).expect("sample checkpoint should encode");
+
+    assert_eq!(encoded, golden_v1_bytes());
+}
+
+#[test]
+fn golden_v1_fixture_decodes_to_expected_checkpoint() {
+    let decoded =
+        read_checkpoint(Cursor::new(golden_v1_bytes())).expect("golden v1 fixture should decode");
+
+    assert_eq!(decoded, sample_checkpoint());
 }
 
 #[test]
