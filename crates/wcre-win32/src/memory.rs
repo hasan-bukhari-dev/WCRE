@@ -150,6 +150,38 @@ pub fn query_memory_map(pid: u32) -> windows::core::Result<MemoryMap> {
     query_memory_map_handle(handle.raw())
 }
 
+/// Query the region containing one address in a process.
+pub fn query_memory_region(pid: u32, address: usize) -> windows::core::Result<MemoryRegion> {
+    let handle = open_process(pid, PROCESS_QUERY_INFORMATION)?;
+    query_memory_region_handle(handle.raw(), address)
+}
+
+pub(crate) fn query_memory_region_handle(
+    handle: HANDLE,
+    address: usize,
+) -> windows::core::Result<MemoryRegion> {
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+
+    // SAFETY:
+    // - handle remains valid for this call.
+    // - address is used only as a query address.
+    // - info is valid writable storage.
+    let bytes_returned = unsafe {
+        VirtualQueryEx(
+            handle,
+            Some(address as *const c_void),
+            &mut info,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+
+    if bytes_returned == 0 {
+        return Err(windows::core::Error::from_thread());
+    }
+
+    Ok(memory_region_from_info(&info))
+}
+
 pub(crate) fn query_memory_map_handle(handle: HANDLE) -> windows::core::Result<MemoryMap> {
     let mut system_info = SYSTEM_INFO::default();
 
@@ -167,71 +199,14 @@ pub(crate) fn query_memory_map_handle(handle: HANDLE) -> windows::core::Result<M
     let mut regions = Vec::new();
 
     while address < maximum {
-        let mut info = MEMORY_BASIC_INFORMATION::default();
-
-        // SAFETY:
-        // - handle remains valid for this call.
-        // - address is used only as a query address.
-        // - info is valid writable storage.
-        let bytes_returned = unsafe {
-            VirtualQueryEx(
-                handle,
-                Some(address as *const c_void),
-                &mut info,
-                size_of::<MEMORY_BASIC_INFORMATION>(),
-            )
-        };
-
-        if bytes_returned == 0 {
-            // windows-result 0.4.x uses from_thread() to capture
-            // GetLastError() from the current Windows thread.
-            return Err(windows::core::Error::from_thread());
-        }
-
-        let base_address = info.BaseAddress as usize;
-        let region_size = info.RegionSize;
+        let region = query_memory_region_handle(handle, address)?;
+        let base_address = region.base_address;
+        let region_size = region.region_size;
 
         if region_size == 0 {
             break;
         }
-
-        let state = memory_state(info.State.0);
-
-        // Windows documents these fields as undefined for MEM_FREE.
-        let allocation_base = if state == MemoryState::Free {
-            0
-        } else {
-            info.AllocationBase as usize
-        };
-
-        let allocation_protection = if state == MemoryState::Free {
-            MemoryProtection(0)
-        } else {
-            MemoryProtection(info.AllocationProtect.0)
-        };
-
-        let kind = if state == MemoryState::Free {
-            MemoryType::None
-        } else {
-            memory_type(info.Type.0)
-        };
-
-        // Protect is undefined for MEM_RESERVE and MEM_FREE.
-        let protection = if state == MemoryState::Commit {
-            MemoryProtection(info.Protect.0)
-        } else {
-            MemoryProtection(0)
-        };
-
-        regions.push(MemoryRegion {
-            base_address,
-            allocation_base,
-            region_size,
-            allocation_protection,
-            state,
-            kind,
-            protection,
-        });
+        regions.push(region);
 
         let next = match base_address.checked_add(region_size) {
             Some(next) => next,
@@ -293,6 +268,42 @@ pub(crate) fn query_memory_map_handle(handle: HANDLE) -> windows::core::Result<M
     }
 
     Ok(map)
+}
+
+fn memory_region_from_info(info: &MEMORY_BASIC_INFORMATION) -> MemoryRegion {
+    let state = memory_state(info.State.0);
+
+    // Windows documents these fields as undefined for MEM_FREE.
+    let allocation_base = if state == MemoryState::Free {
+        0
+    } else {
+        info.AllocationBase as usize
+    };
+    let allocation_protection = if state == MemoryState::Free {
+        MemoryProtection(0)
+    } else {
+        MemoryProtection(info.AllocationProtect.0)
+    };
+    let kind = if state == MemoryState::Free {
+        MemoryType::None
+    } else {
+        memory_type(info.Type.0)
+    };
+    let protection = if state == MemoryState::Commit {
+        MemoryProtection(info.Protect.0)
+    } else {
+        MemoryProtection(0)
+    };
+
+    MemoryRegion {
+        base_address: info.BaseAddress as usize,
+        allocation_base,
+        region_size: info.RegionSize,
+        allocation_protection,
+        state,
+        kind,
+        protection,
+    }
 }
 
 fn memory_state(raw: u32) -> MemoryState {
