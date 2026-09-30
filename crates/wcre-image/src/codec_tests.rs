@@ -438,3 +438,54 @@ fn encoder_rejects_rsp_outside_captured_stack() {
     assert!(matches!(error, WcrError::InvalidData(_)));
     assert!(bytes.is_empty());
 }
+
+#[test]
+fn v2_writer_emits_hashed_header_body_and_digest_trailer() {
+    let checkpoint = sample_checkpoint();
+    let mut bytes = Vec::new();
+
+    crate::write_checkpoint_v2(&checkpoint, &mut bytes).expect("v2 checkpoint should encode");
+
+    assert_eq!(&bytes[0..8], &crate::format::WCR_MAGIC);
+
+    let format_version = u32::from_le_bytes(bytes[8..12].try_into().expect("format version"));
+    let header_size = u32::from_le_bytes(bytes[12..16].try_into().expect("header size"));
+    let body_length = u64::from_le_bytes(bytes[44..52].try_into().expect("body length"));
+    let integrity_algorithm =
+        u32::from_le_bytes(bytes[52..56].try_into().expect("integrity algorithm"));
+
+    assert_eq!(format_version, crate::format::WCR_FORMAT_VERSION_V2);
+    assert_eq!(header_size, crate::format::WCR_V2_HEADER_SIZE);
+    assert_eq!(integrity_algorithm, crate::format::WCR_INTEGRITY_SHA256);
+
+    let expected_file_length =
+        u64::from(header_size) + body_length + crate::format::WCR_V2_DIGEST_SIZE as u64;
+
+    assert_eq!(bytes.len() as u64, expected_file_length);
+
+    let digest_start = bytes.len() - crate::format::WCR_V2_DIGEST_SIZE;
+    let expected_digest = crate::integrity::sha256(&bytes[..digest_start]);
+
+    assert_eq!(&bytes[digest_start..], expected_digest.as_slice());
+}
+
+#[test]
+fn v2_digest_changes_when_hashed_bytes_are_modified() {
+    let checkpoint = sample_checkpoint();
+    let mut bytes = Vec::new();
+
+    crate::write_checkpoint_v2(&checkpoint, &mut bytes).expect("v2 checkpoint should encode");
+
+    let digest_start = bytes.len() - crate::format::WCR_V2_DIGEST_SIZE;
+    let stored_digest = bytes[digest_start..].to_vec();
+
+    let body_start = crate::format::WCR_V2_HEADER_SIZE as usize;
+
+    assert!(body_start < digest_start);
+
+    bytes[body_start] ^= 0x01;
+
+    let corrupted_digest = crate::integrity::sha256(&bytes[..digest_start]);
+
+    assert_ne!(stored_digest.as_slice(), corrupted_digest.as_slice());
+}

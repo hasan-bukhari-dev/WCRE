@@ -30,7 +30,7 @@ pub const WCR_FORMAT_VERSION: u32 = WCR_FORMAT_VERSION_V1;
 /// - thread count:          4
 /// - body length:           8
 /// - integrity algorithm:   4
-pub const WCR_V2_HEADER_SIZE: u32 = 60;
+pub const WCR_V2_HEADER_SIZE: u32 = 56;
 
 /// SHA-256 trailer size.
 pub const WCR_V2_DIGEST_SIZE: usize = 32;

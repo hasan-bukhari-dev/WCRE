@@ -22,6 +22,7 @@ impl Sha256State {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn sha256(bytes: &[u8]) -> [u8; WCR_V2_DIGEST_SIZE] {
     let mut state = Sha256State::new();
     state.update(bytes);
