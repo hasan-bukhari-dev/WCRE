@@ -2,9 +2,10 @@ use std::env;
 use std::process::ExitCode;
 
 use wcre_win32::{
-    MemoryTypeReadSummary, capture_snapshot_probe, capture_thread_contexts,
-    capture_thread_state_validation, capture_va_clone, compare_va_clone_memory,
-    diff_va_clone_private_memory, inspect_process, query_memory_map, read_process_memory,
+    MemoryTypeReadSummary, capture_checkpoint_model, capture_image_inventory,
+    capture_snapshot_probe, capture_thread_contexts, capture_thread_state_validation,
+    capture_va_clone, compare_va_clone_memory, diff_va_clone_private_memory, inspect_process,
+    query_memory_map, read_process_memory,
 };
 
 fn main() -> ExitCode {
@@ -42,6 +43,15 @@ fn run() -> Result<(), String> {
             run_snapshot(pid)
         }
 
+        Some("checkpoint-model") => {
+            let pid = parse_pid_arguments(args.collect(), "checkpoint-model")?;
+
+            run_checkpoint_model(pid)
+        }
+        Some("snapshot-images") => {
+            let pid = parse_pid_arguments(args.collect(), "snapshot-images")?;
+            run_snapshot_images(pid)
+        }
         Some("snapshot-threads") => {
             let pid = parse_pid_arguments(args.collect(), "snapshot-threads")?;
             run_snapshot_threads(pid)
@@ -210,6 +220,238 @@ fn run_snapshot(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
+fn run_checkpoint_model(pid: u32) -> Result<(), String> {
+    let checkpoint = capture_checkpoint_model(pid).map_err(|error| {
+        format!("failed to capture WCRE checkpoint model for PID {pid}: {error}")
+    })?;
+
+    println!("WCRE Checkpoint Model");
+    println!();
+
+    println!("{:<24}{}", "Model version:", checkpoint.model_version);
+
+    println!("{:<24}{}", "Captured PID:", checkpoint.process.captured_pid);
+
+    println!(
+        "{:<24}{:?}",
+        "Architecture:", checkpoint.process.architecture
+    );
+
+    println!("{:<24}{}", "Process image:", checkpoint.process.image_path);
+
+    println!("{:<24}{}", "Loaded images:", checkpoint.images.len());
+
+    println!(
+        "{:<24}{}",
+        "Memory regions:",
+        checkpoint.memory_regions.len()
+    );
+
+    println!("{:<24}{}", "Live threads:", checkpoint.threads.len());
+
+    println!("{:<24}{}", "Memory payloads:", checkpoint.payloads.len());
+
+    println!();
+    println!("Threads");
+    println!("-------");
+
+    for thread in &checkpoint.threads {
+        println!(
+            "TID {:<8} TEB {:016X}",
+            thread.thread_id, thread.teb_base_address
+        );
+
+        match (thread.stack_limit, thread.stack_base) {
+            (Some(limit), Some(base)) => {
+                println!("  stack {:016X}-{:016X}", limit, base);
+            }
+
+            _ => {
+                println!("  stack <unavailable>");
+            }
+        }
+
+        match &thread.context {
+            Some(context) => {
+                let owner = checkpoint
+                    .images
+                    .iter()
+                    .find(|image| image.contains(context.rip));
+
+                println!(
+                    "  RIP   {:016X} -> {}",
+                    context.rip,
+                    owner
+                        .and_then(|image| image.mapped_path.as_deref())
+                        .unwrap_or("<no captured image>")
+                );
+
+                println!("  RSP   {:016X}", context.rsp);
+            }
+
+            None => {
+                println!("  context <unavailable>");
+            }
+        }
+    }
+
+    println!();
+    println!("Checkpoint-model status");
+    println!("-----------------------");
+
+    let all_live_contexts = checkpoint
+        .threads
+        .iter()
+        .all(|thread| thread.context.is_some());
+
+    let all_stack_metadata = checkpoint
+        .threads
+        .iter()
+        .all(|thread| thread.stack_base.is_some() && thread.stack_limit.is_some());
+
+    println!("{:<28}{}", "All live contexts:", yes_no(all_live_contexts));
+
+    println!(
+        "{:<28}{}",
+        "All stack metadata:",
+        yes_no(all_stack_metadata)
+    );
+
+    println!(
+        "{:<28}{}",
+        "Image inventory present:",
+        yes_no(!checkpoint.images.is_empty())
+    );
+
+    println!(
+        "{:<28}{}",
+        "Memory map present:",
+        yes_no(!checkpoint.memory_regions.is_empty())
+    );
+    println!(
+        "{:<28}{}",
+        "Payload-linked regions:",
+        checkpoint
+            .memory_regions
+            .iter()
+            .filter(|region| region.payload_id.is_some())
+            .count()
+    );
+
+    println!("{:<28}{}", "Memory payloads:", checkpoint.payloads.len());
+
+    println!(
+        "{:<28}{}",
+        "Payload bytes:",
+        format_size(checkpoint.payload_bytes())
+    );
+
+    println!(
+        "{:<28}{}",
+        "Payload links valid:",
+        yes_no(checkpoint.payload_links_valid())
+    );
+
+    println!(
+        "{:<28}{}",
+        "Payload IDs unique:",
+        yes_no(checkpoint.payload_ids_unique())
+    );
+
+    println!(
+        "{:<28}{}",
+        "Every payload referenced:",
+        yes_no(checkpoint.every_payload_referenced_once())
+    );
+
+    if checkpoint.threads.is_empty() {
+        return Err("checkpoint model contains no live threads".to_string());
+    }
+
+    if !all_live_contexts {
+        return Err("checkpoint model contains a live thread without a context".to_string());
+    }
+
+    if !all_stack_metadata {
+        return Err("checkpoint model contains incomplete stack metadata".to_string());
+    }
+
+    if checkpoint.images.is_empty() {
+        return Err("checkpoint model contains no executable images".to_string());
+    }
+
+    if checkpoint.memory_regions.is_empty() {
+        return Err("checkpoint model contains no memory-region metadata".to_string());
+    }
+
+    Ok(())
+}
+fn run_snapshot_images(pid: u32) -> Result<(), String> {
+    let report = capture_image_inventory(pid)
+        .map_err(|error| format!("failed to capture PSS image inventory for PID {pid}: {error}"))?;
+
+    println!("WCRE PSS Image Inventory");
+    println!();
+
+    println!("{:<24}{}", "Source PID:", report.source_pid);
+    println!("{:<24}{}", "VA clone PID:", report.clone_pid);
+    println!("{:<24}{}", "VA regions walked:", report.va_regions);
+    println!("{:<24}{}", "Thread entries:", report.threads.len());
+    println!("{:<24}{}", "Loaded images:", report.images.len());
+
+    println!();
+    println!("Loaded images");
+    println!("-------------");
+
+    println!(
+        "{:<18} {:<18} {:>10} {:>10} {:>10}  {}",
+        "Loaded base", "Preferred base", "Size", "Timestamp", "Checksum", "Path"
+    );
+
+    for image in &report.images {
+        println!(
+            "{:016X}  {:016X}  {:>10} {:08X}   {:08X}  {}",
+            image.loaded_base,
+            image.preferred_image_base,
+            format_size(image.size_of_image as u64),
+            image.time_date_stamp,
+            image.checksum,
+            image.mapped_path.as_deref().unwrap_or("<unavailable>")
+        );
+    }
+
+    println!();
+    println!("Captured RIP ownership");
+    println!("----------------------");
+
+    for thread in report.threads.iter().filter(|thread| !thread.terminated) {
+        let Some(context) = &thread.context else {
+            println!("TID {:<8} <no captured context>", thread.thread_id);
+            continue;
+        };
+
+        let owner = report
+            .images
+            .iter()
+            .find(|image| image.contains(context.rip as usize));
+
+        match owner {
+            Some(image) => println!(
+                "TID {:<8} RIP {:016X} -> {}",
+                thread.thread_id,
+                context.rip,
+                image.mapped_path.as_deref().unwrap_or("<unnamed image>")
+            ),
+
+            None => println!(
+                "TID {:<8} RIP {:016X} -> <no captured image>",
+                thread.thread_id, context.rip
+            ),
+        }
+    }
+
+    Ok(())
+}
 fn run_snapshot_threads(pid: u32) -> Result<(), String> {
     let report = capture_thread_contexts(pid)
         .map_err(|error| format!("failed to capture PSS thread contexts for PID {pid}: {error}"))?;
@@ -811,6 +1053,8 @@ fn print_help() {
     println!("  wcre-cli memory-map --pid <PID>");
     println!("  wcre-cli memory-read --pid <PID>");
     println!("  wcre-cli snapshot --pid <PID>");
+    println!("  wcre-cli checkpoint-model --pid <PID>");
+    println!("  wcre-cli snapshot-images --pid <PID>");
     println!("  wcre-cli snapshot-threads --pid <PID>");
     println!("  wcre-cli snapshot-verify --pid <PID>");
     println!("  wcre-cli snapshot-private-diff --pid <PID>");

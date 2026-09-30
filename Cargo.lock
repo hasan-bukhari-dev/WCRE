@@ -45,6 +45,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wcre-image"
+version = "0.0.1"
+
+[[package]]
 name = "wcre-native-x64-target"
 version = "0.1.0"
 
@@ -52,6 +56,7 @@ version = "0.1.0"
 name = "wcre-win32"
 version = "0.0.1"
 dependencies = [
+ "wcre-image",
  "windows",
 ]
 

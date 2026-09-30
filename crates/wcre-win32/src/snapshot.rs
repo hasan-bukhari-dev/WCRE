@@ -1,16 +1,23 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 
+use wcre_image::{
+    Architecture as CheckpointArchitecture, CheckpointModel, ImageRecord,
+    MemoryKind as CheckpointMemoryKind, MemoryPayload,
+    MemoryProtection as CheckpointMemoryProtection, MemoryRegionRecord,
+    MemoryState as CheckpointMemoryState, ProcessRecord, ThreadRecord, X64ContextSubset,
+};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_ALL_AMD64, ReadProcessMemory};
 use windows::Win32::System::Diagnostics::ProcessSnapshotting::{
     HPSS, HPSSWALK, PSS_CAPTURE_FLAGS, PSS_CAPTURE_THREAD_CONTEXT, PSS_CAPTURE_THREADS,
-    PSS_CAPTURE_VA_CLONE, PSS_QUERY_VA_CLONE_INFORMATION, PSS_THREAD_ENTRY,
-    PSS_VA_CLONE_INFORMATION, PSS_WALK_THREADS, PssCaptureSnapshot, PssFreeSnapshot,
-    PssQuerySnapshot, PssWalkMarkerCreate, PssWalkMarkerFree, PssWalkSnapshot,
+    PSS_CAPTURE_VA_CLONE, PSS_CAPTURE_VA_SPACE, PSS_CAPTURE_VA_SPACE_SECTION_INFORMATION,
+    PSS_QUERY_VA_CLONE_INFORMATION, PSS_THREAD_ENTRY, PSS_VA_CLONE_INFORMATION, PSS_VA_SPACE_ENTRY,
+    PSS_WALK_THREADS, PSS_WALK_VA_SPACE, PssCaptureSnapshot, PssFreeSnapshot, PssQuerySnapshot,
+    PssWalkMarkerCreate, PssWalkMarkerFree, PssWalkSnapshot,
 };
 use windows::Win32::System::Memory::{
-    PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+    MEM_IMAGE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetProcessId, PROCESS_CREATE_PROCESS, PROCESS_QUERY_INFORMATION,
@@ -22,7 +29,7 @@ use crate::memory::{
     MemoryProtection, MemoryRegion, MemoryState, MemoryType, query_memory_map_handle,
 };
 use crate::memory_read::{MemoryReadReport, is_readable_protection, read_process_memory_handle};
-use crate::process::open_process;
+use crate::process::{ProcessArchitecture, inspect_process, open_process};
 
 /// An owned PSS snapshot containing a VA clone.
 ///
@@ -133,6 +140,409 @@ fn capture_va_clone_with_threads(pid: u32) -> windows::core::Result<VaCloneSnaps
         PSS_CAPTURE_VA_CLONE | PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT,
         Some(CONTEXT_ALL_AMD64.0),
     )
+}
+/// Capture the state classes that are currently candidates for the WCRE
+/// checkpoint model.
+///
+/// This remains a capture-only research primitive. It does not imply that
+/// every captured state class is sufficient for restoration.
+fn capture_checkpoint_snapshot(pid: u32) -> windows::core::Result<VaCloneSnapshot> {
+    capture_snapshot(
+        pid,
+        PSS_CAPTURE_VA_CLONE
+            | PSS_CAPTURE_THREADS
+            | PSS_CAPTURE_THREAD_CONTEXT
+            | PSS_CAPTURE_VA_SPACE
+            | PSS_CAPTURE_VA_SPACE_SECTION_INFORMATION,
+        Some(CONTEXT_ALL_AMD64.0),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotImage {
+    /// Base where the image is actually mapped in this process.
+    pub loaded_base: usize,
+
+    /// Preferred PE ImageBase.
+    pub preferred_image_base: usize,
+
+    pub size_of_image: u32,
+    pub time_date_stamp: u32,
+    pub checksum: u32,
+
+    /// Captured backing path. This may use the NT namespace.
+    pub mapped_path: Option<String>,
+}
+
+impl SnapshotImage {
+    pub fn end_address(&self) -> usize {
+        self.loaded_base.saturating_add(self.size_of_image as usize)
+    }
+
+    pub fn contains(&self, address: usize) -> bool {
+        address >= self.loaded_base && address < self.end_address()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotImageReport {
+    pub source_pid: u32,
+    pub clone_pid: u32,
+
+    /// Number of VA-space entries walked before image deduplication.
+    pub va_regions: usize,
+
+    /// Thread state and image identity were obtained from this same snapshot.
+    pub threads: Vec<SnapshotThread>,
+
+    /// One record per loaded MEM_IMAGE allocation base.
+    pub images: Vec<SnapshotImage>,
+}
+
+fn copy_mapped_file_name(entry: &PSS_VA_SPACE_ENTRY) -> Option<String> {
+    let byte_len = entry.MappedFileNameLength as usize;
+
+    if byte_len == 0 || byte_len % size_of::<u16>() != 0 {
+        return None;
+    }
+
+    let pointer = entry.MappedFileName.0;
+
+    if pointer.is_null() {
+        return None;
+    }
+
+    let unit_len = byte_len / size_of::<u16>();
+
+    // SAFETY:
+    // - PSS supplies MappedFileName and MappedFileNameLength together.
+    // - Microsoft documents the length in bytes.
+    // - the pointer remains valid for the lifetime of this walk marker.
+    // - we copy the UTF-16 contents immediately into WCRE-owned memory.
+    let units = unsafe { std::slice::from_raw_parts(pointer, unit_len) };
+
+    Some(String::from_utf16_lossy(units))
+}
+
+fn walk_snapshot_images(
+    snapshot_handle: HPSS,
+) -> windows::core::Result<(usize, Vec<SnapshotImage>)> {
+    let marker = create_walk_marker()?;
+
+    let mut va_regions = 0usize;
+    let mut images = Vec::new();
+
+    loop {
+        let mut entry = PSS_VA_SPACE_ENTRY::default();
+
+        let entry_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                (&mut entry as *mut PSS_VA_SPACE_ENTRY).cast::<u8>(),
+                size_of::<PSS_VA_SPACE_ENTRY>(),
+            )
+        };
+
+        let result = unsafe {
+            PssWalkSnapshot(
+                snapshot_handle,
+                PSS_WALK_VA_SPACE,
+                marker.0,
+                Some(entry_bytes),
+            )
+        };
+
+        if result == ERROR_NO_MORE_ITEMS_CODE {
+            break;
+        }
+
+        win32_result(result)?;
+        va_regions += 1;
+
+        if entry.Type != MEM_IMAGE.0 {
+            continue;
+        }
+
+        let loaded_base = entry.AllocationBase as usize;
+
+        if loaded_base == 0 {
+            continue;
+        }
+
+        // PSS walks individual VA regions. Multiple regions belonging to the
+        // same PE image share AllocationBase, so collapse them into one
+        // image identity record.
+        if images
+            .iter()
+            .any(|image: &SnapshotImage| image.loaded_base == loaded_base)
+        {
+            continue;
+        }
+
+        images.push(SnapshotImage {
+            loaded_base,
+            preferred_image_base: entry.ImageBase as usize,
+            size_of_image: entry.SizeOfImage,
+            time_date_stamp: entry.TimeDateStamp,
+            checksum: entry.CheckSum,
+            mapped_path: copy_mapped_file_name(&entry),
+        });
+    }
+
+    images.sort_by_key(|image| image.loaded_base);
+
+    Ok((va_regions, images))
+}
+
+/// Capture thread state and loaded-image identity from one PSS snapshot.
+pub fn capture_image_inventory(pid: u32) -> windows::core::Result<SnapshotImageReport> {
+    let snapshot = capture_checkpoint_snapshot(pid)?;
+
+    let threads = walk_snapshot_threads(snapshot.snapshot_handle)?;
+    let (va_regions, images) = walk_snapshot_images(snapshot.snapshot_handle)?;
+
+    Ok(SnapshotImageReport {
+        source_pid: snapshot.source_pid(),
+        clone_pid: snapshot.clone_pid(),
+        va_regions,
+        threads,
+        images,
+    })
+}
+fn checkpoint_architecture(architecture: ProcessArchitecture) -> CheckpointArchitecture {
+    match architecture {
+        ProcessArchitecture::X64 => CheckpointArchitecture::X64,
+        ProcessArchitecture::X86 => CheckpointArchitecture::X86,
+        ProcessArchitecture::Arm64 => CheckpointArchitecture::Arm64,
+        ProcessArchitecture::Arm32 => CheckpointArchitecture::Arm32,
+        ProcessArchitecture::Ia64 => CheckpointArchitecture::Ia64,
+        ProcessArchitecture::Unknown(value) => CheckpointArchitecture::Unknown(value),
+    }
+}
+
+fn checkpoint_memory_state(state: MemoryState) -> CheckpointMemoryState {
+    match state {
+        MemoryState::Commit => CheckpointMemoryState::Commit,
+        MemoryState::Reserve => CheckpointMemoryState::Reserve,
+        MemoryState::Free => CheckpointMemoryState::Free,
+        MemoryState::Unknown(value) => CheckpointMemoryState::Unknown(value),
+    }
+}
+
+fn checkpoint_memory_kind(kind: MemoryType) -> CheckpointMemoryKind {
+    match kind {
+        MemoryType::Private => CheckpointMemoryKind::Private,
+        MemoryType::Mapped => CheckpointMemoryKind::Mapped,
+        MemoryType::Image => CheckpointMemoryKind::Image,
+        MemoryType::None => CheckpointMemoryKind::None,
+        MemoryType::Unknown(value) => CheckpointMemoryKind::Unknown(value),
+    }
+}
+
+fn checkpoint_context(context: &X64RegisterContext) -> X64ContextSubset {
+    X64ContextSubset {
+        rax: context.rax,
+        rbx: context.rbx,
+        rcx: context.rcx,
+        rdx: context.rdx,
+        rsi: context.rsi,
+        rdi: context.rdi,
+
+        r8: context.r8,
+        r9: context.r9,
+        r10: context.r10,
+        r11: context.r11,
+        r12: context.r12,
+        r13: context.r13,
+        r14: context.r14,
+        r15: context.r15,
+
+        rip: context.rip,
+        rsp: context.rsp,
+        rbp: context.rbp,
+
+        eflags: context.eflags,
+    }
+}
+
+const CHECKPOINT_PAYLOAD_READ_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Decide whether a VA region currently contributes byte payload to the
+/// in-memory WCRE checkpoint model.
+///
+/// For the first controlled checkpoint model we preserve every committed,
+/// readable region regardless of whether Windows classifies it as Private,
+/// Mapped, or Image. Mutable program data can live in MEM_IMAGE pages, so
+/// omitting images here would lose real process state.
+///
+/// Known Windows-managed volatile state is deliberately excluded.
+fn should_capture_checkpoint_payload(region: &MemoryRegion) -> bool {
+    region.state == MemoryState::Commit
+        && is_readable_protection(region.protection.0)
+        && !is_known_system_volatile_region(region.base_address, region.region_size)
+}
+
+/// Copy one checkpoint-candidate region from the PSS VA clone into
+/// WCRE-owned memory.
+///
+/// A short read is treated as an error. A payload recorded in the checkpoint
+/// model must represent the complete region it claims to contain.
+fn read_checkpoint_payload_bytes(
+    handle: HANDLE,
+    region: &MemoryRegion,
+) -> windows::core::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(region.region_size);
+    let mut scratch = vec![0u8; CHECKPOINT_PAYLOAD_READ_CHUNK_SIZE];
+
+    let mut offset = 0usize;
+
+    while offset < region.region_size {
+        let remaining = region.region_size - offset;
+        let chunk_size = remaining.min(CHECKPOINT_PAYLOAD_READ_CHUNK_SIZE);
+
+        let address = region
+            .base_address
+            .checked_add(offset)
+            .ok_or_else(|| Error::from_hresult(HRESULT::from_win32(87)))?;
+
+        let mut bytes_read = 0usize;
+
+        // SAFETY:
+        // - handle is the valid VA-clone handle owned by the active PSS
+        //   snapshot.
+        // - region was discovered through VirtualQueryEx on that same clone.
+        // - only committed readable, non-guarded regions reach this function.
+        // - scratch contains at least chunk_size writable bytes.
+        unsafe {
+            ReadProcessMemory(
+                handle,
+                address as *const c_void,
+                scratch.as_mut_ptr() as *mut c_void,
+                chunk_size,
+                Some(&mut bytes_read),
+            )?;
+        }
+
+        if bytes_read != chunk_size {
+            // ERROR_PARTIAL_COPY
+            return Err(Error::from_hresult(HRESULT::from_win32(299)));
+        }
+
+        bytes.extend_from_slice(&scratch[..bytes_read]);
+        offset += chunk_size;
+    }
+
+    debug_assert_eq!(bytes.len(), region.region_size);
+
+    Ok(bytes)
+}
+/// Capture a WCRE-owned checkpoint model from a Windows process.
+///
+/// Stable process provenance (image path and architecture) is queried from
+/// the source process. Volatile execution state below is derived from one
+/// checkpoint-capable PSS snapshot:
+///
+/// - live thread inventory and selected x64 contexts
+/// - TEB-reported stack metadata
+/// - loaded PE image identities
+/// - virtual-memory-region metadata
+///
+/// Complete bytes are copied for committed readable checkpoint-candidate
+/// regions from that same VA clone. Known Windows-managed volatile state is
+/// deliberately omitted.
+pub fn capture_checkpoint_model(pid: u32) -> windows::core::Result<CheckpointModel> {
+    let process_info = inspect_process(pid)?;
+
+    let snapshot = capture_checkpoint_snapshot(pid)?;
+
+    let threads = walk_snapshot_threads(snapshot.snapshot_handle)?;
+    let (_, images) = walk_snapshot_images(snapshot.snapshot_handle)?;
+    let memory_map = query_memory_map_handle(snapshot.clone_handle())?;
+
+    let process = ProcessRecord {
+        captured_pid: process_info.pid,
+        architecture: checkpoint_architecture(process_info.architecture),
+        image_path: process_info.image_path.to_string_lossy().into_owned(),
+    };
+
+    let mut checkpoint = CheckpointModel::new(process);
+
+    checkpoint.images = images
+        .into_iter()
+        .map(|image| ImageRecord {
+            loaded_base: image.loaded_base as u64,
+            preferred_image_base: image.preferred_image_base as u64,
+            size_of_image: image.size_of_image,
+            time_date_stamp: image.time_date_stamp,
+            checksum: image.checksum,
+            mapped_path: image.mapped_path,
+        })
+        .collect();
+
+    for region in &memory_map.regions {
+        let payload_id = if should_capture_checkpoint_payload(region) {
+            let id = checkpoint.payloads.len() as u64 + 1;
+
+            let bytes = read_checkpoint_payload_bytes(snapshot.clone_handle(), region)?;
+
+            checkpoint.payloads.push(MemoryPayload {
+                id,
+                base_address: region.base_address as u64,
+                bytes,
+            });
+
+            Some(id)
+        } else {
+            None
+        };
+
+        checkpoint.memory_regions.push(MemoryRegionRecord {
+            base_address: region.base_address as u64,
+            allocation_base: region.allocation_base as u64,
+            region_size: region.region_size as u64,
+
+            allocation_protection: CheckpointMemoryProtection {
+                raw: region.allocation_protection.0,
+            },
+
+            state: checkpoint_memory_state(region.state),
+            kind: checkpoint_memory_kind(region.kind),
+
+            protection: CheckpointMemoryProtection {
+                raw: region.protection.0,
+            },
+
+            payload_id,
+        });
+    }
+
+    checkpoint.threads = threads
+        .into_iter()
+        .filter(|thread| !thread.terminated)
+        .map(|thread| {
+            let stack_base = thread
+                .teb_base_address
+                .checked_add(X64_TEB_STACK_BASE_OFFSET)
+                .and_then(|address| snapshot_read_u64(snapshot.clone_handle(), address));
+
+            let stack_limit = thread
+                .teb_base_address
+                .checked_add(X64_TEB_STACK_LIMIT_OFFSET)
+                .and_then(|address| snapshot_read_u64(snapshot.clone_handle(), address));
+
+            ThreadRecord {
+                process_id: thread.process_id,
+                thread_id: thread.thread_id,
+                teb_base_address: thread.teb_base_address as u64,
+
+                stack_base,
+                stack_limit,
+
+                context: thread.context.as_ref().map(checkpoint_context),
+            }
+        })
+        .collect();
+
+    Ok(checkpoint)
 }
 #[derive(Debug, Clone)]
 pub struct SnapshotMemoryComparison {
