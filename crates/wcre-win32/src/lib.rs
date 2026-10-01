@@ -37,7 +37,7 @@ pub use snapshot::{
 };
 
 pub const PROJECT_NAME: &str = "WCRE";
-pub const CURRENT_MILESTONE: &str = "M0 - Process State Capture";
+pub const CURRENT_MILESTONE: &str = "M2 - Memory Restoration Research";
 
 #[cfg(test)]
 mod tests {
