@@ -6,6 +6,7 @@
 //!
 //! No process restoration functionality is implemented yet.
 
+mod exact_allocation;
 mod memory;
 mod memory_read;
 mod process;
@@ -13,6 +14,11 @@ mod snapshot;
 
 pub use memory::{
     MemoryMap, MemoryProtection, MemoryRegion, MemoryState, MemoryType, query_memory_map,
+    query_memory_region,
+};
+
+pub use exact_allocation::{
+    ExactAddressAllocation, ExactAddressSpaceSession, ExactAllocationError,
 };
 
 pub use memory_read::{

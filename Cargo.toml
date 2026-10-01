@@ -6,4 +6,5 @@ members = [
     "crates/wcre-image",
     "crates/wcre-win32",
     "tests/targets/native-x64",
+    "tests/targets/restore-host",
 ]

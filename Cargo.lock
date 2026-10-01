@@ -218,6 +218,10 @@ name = "wcre-native-x64-target"
 version = "0.1.0"
 
 [[package]]
+name = "wcre-restore-host"
+version = "0.1.0"
+
+[[package]]
 name = "wcre-win32"
 version = "0.0.1"
 dependencies = [
