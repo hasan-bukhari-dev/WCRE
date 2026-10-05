@@ -2,8 +2,9 @@ use std::ffi::c_void;
 use std::fmt;
 
 use windows::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAllocEx,
-    VirtualFreeEx,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_GUARD, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE,
+    VirtualAllocEx, VirtualFreeEx, VirtualProtectEx,
 };
 use windows::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION};
 
@@ -43,6 +44,9 @@ pub enum ExactAllocationError {
     OutsideOwnedReservation {
         base_address: u64,
         size: u64,
+    },
+    UnsupportedProtection {
+        protection: u32,
     },
     AddressConflict {
         requested_base: u64,
@@ -90,6 +94,10 @@ impl fmt::Display for ExactAllocationError {
                 f,
                 "commit 0x{base_address:016X} + 0x{size:X} is outside this session's reservations"
             ),
+            Self::UnsupportedProtection { protection } => write!(
+                f,
+                "captured protection 0x{protection:08X} is not supported by the first PRIVATE restore envelope"
+            ),
             Self::AddressConflict {
                 requested_base,
                 requested_size,
@@ -126,9 +134,10 @@ impl std::error::Error for ExactAllocationError {
 
 /// Owns exact reservations made in one remote process.
 ///
-/// Successful reservations are released when the session is dropped. The
-/// first reconstruction envelope commits with temporary read/write
-/// protection; final checkpoint protections belong to a later feature.
+/// Successful reservations are released when the session is dropped. Memory
+/// is initially committed with temporary read/write protection so captured
+/// payload bytes can be installed and verified before final protection is
+/// restored.
 pub struct ExactAddressSpaceSession {
     pid: u32,
     handle: ProcessHandle,
@@ -259,6 +268,55 @@ impl ExactAddressSpaceSession {
         Ok(ExactAddressAllocation { base_address, size })
     }
 
+    pub fn restore_protection_exact(
+        &self,
+        base_address: u64,
+        size: u64,
+        protection: u32,
+    ) -> Result<u32, ExactAllocationError> {
+        validate_range(base_address, size, WINDOWS_X64_PAGE_SIZE)?;
+
+        let end = base_address
+            .checked_add(size)
+            .ok_or(ExactAllocationError::RangeOverflow { base_address, size })?;
+
+        let owned = self.reservations.iter().any(|reservation| {
+            let reservation_end = reservation.base_address + reservation.size;
+            base_address >= reservation.base_address && end <= reservation_end
+        });
+
+        if !owned {
+            return Err(ExactAllocationError::OutsideOwnedReservation { base_address, size });
+        }
+
+        let base = address_to_usize(base_address)?;
+        let size_usize = size_to_usize(size)?;
+        let new_protection = validate_private_protection(protection)?;
+        let mut old_protection = PAGE_PROTECTION_FLAGS(0);
+
+        // SAFETY:
+        // - handle remains valid and has PROCESS_VM_OPERATION access.
+        // - the requested range is page-aligned and lies inside a reservation
+        //   owned by this reconstruction session.
+        // - the protection value passed to Windows was explicitly accepted by
+        //   the first PRIVATE restore envelope.
+        unsafe {
+            VirtualProtectEx(
+                self.handle.raw(),
+                base as *const c_void,
+                size_usize,
+                new_protection,
+                &mut old_protection,
+            )
+        }
+        .map_err(|error| ExactAllocationError::Windows {
+            operation: "VirtualProtectEx",
+            error,
+        })?;
+
+        Ok(old_protection.0)
+    }
+
     pub fn query(&self, address: u64) -> Result<MemoryRegion, ExactAllocationError> {
         let address = address_to_usize(address)?;
         query_memory_region_handle(self.handle.raw(), address).map_err(|error| {
@@ -348,6 +406,30 @@ fn validate_range(
     Ok(())
 }
 
+fn validate_private_protection(
+    protection: u32,
+) -> Result<PAGE_PROTECTION_FLAGS, ExactAllocationError> {
+    let has_guard = protection & PAGE_GUARD.0 != 0;
+    let base_protection = protection & !PAGE_GUARD.0;
+
+    let supported_base = [
+        PAGE_NOACCESS.0,
+        PAGE_READONLY.0,
+        PAGE_READWRITE.0,
+        PAGE_EXECUTE.0,
+        PAGE_EXECUTE_READ.0,
+        PAGE_EXECUTE_READWRITE.0,
+    ];
+
+    if !supported_base.contains(&base_protection)
+        || (has_guard && base_protection == PAGE_NOACCESS.0)
+    {
+        return Err(ExactAllocationError::UnsupportedProtection { protection });
+    }
+
+    Ok(PAGE_PROTECTION_FLAGS(protection))
+}
+
 fn address_to_usize(value: u64) -> Result<usize, ExactAllocationError> {
     usize::try_from(value).map_err(|_| ExactAllocationError::AddressOutOfRange { value })
 }
@@ -419,6 +501,57 @@ mod tests {
         assert_eq!(observed_committed.allocation_base, base);
         assert_eq!(observed_committed.state, MemoryState::Commit);
         assert_eq!(observed_committed.kind, MemoryType::Private);
+        assert_eq!(observed_committed.protection.0, PAGE_READWRITE.0);
+
+        let previous_protection = session
+            .restore_protection_exact(base as u64, WINDOWS_X64_PAGE_SIZE, PAGE_READONLY.0)
+            .expect("captured protection should restore");
+        assert_eq!(previous_protection, PAGE_READWRITE.0);
+
+        let observed_protected = session
+            .query(base as u64)
+            .expect("protected region should query");
+        assert_eq!(observed_protected.state, MemoryState::Commit);
+        assert_eq!(observed_protected.protection.0, PAGE_READONLY.0);
+
+        let previous_protection = session
+            .restore_protection_exact(
+                base as u64,
+                WINDOWS_X64_PAGE_SIZE,
+                PAGE_READWRITE.0 | PAGE_GUARD.0,
+            )
+            .expect("PAGE_GUARD modifier should restore on supported PRIVATE protection");
+        assert_eq!(previous_protection, PAGE_READONLY.0);
+
+        let observed_guarded = session
+            .query(base as u64)
+            .expect("guarded region should query");
+        assert_eq!(observed_guarded.state, MemoryState::Commit);
+        assert_eq!(
+            observed_guarded.protection.0,
+            PAGE_READWRITE.0 | PAGE_GUARD.0
+        );
+
+        let invalid_guard_noaccess = session
+            .restore_protection_exact(
+                base as u64,
+                WINDOWS_X64_PAGE_SIZE,
+                PAGE_NOACCESS.0 | PAGE_GUARD.0,
+            )
+            .expect_err("PAGE_GUARD must not be accepted with PAGE_NOACCESS");
+        assert!(matches!(
+            invalid_guard_noaccess,
+            ExactAllocationError::UnsupportedProtection { protection }
+                if protection == (PAGE_NOACCESS.0 | PAGE_GUARD.0)
+        ));
+
+        let unsupported = session
+            .restore_protection_exact(base as u64, WINDOWS_X64_PAGE_SIZE, 0x08)
+            .expect_err("PAGE_WRITECOPY must be rejected for PRIVATE restoration");
+        assert!(matches!(
+            unsupported,
+            ExactAllocationError::UnsupportedProtection { protection: 0x08 }
+        ));
 
         session
             .release_all()

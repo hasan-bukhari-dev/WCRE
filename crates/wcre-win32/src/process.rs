@@ -52,6 +52,16 @@ impl fmt::Display for ProcessArchitecture {
 pub(crate) struct ProcessHandle(HANDLE);
 
 impl ProcessHandle {
+    /// Adopt ownership of a process HANDLE returned by a successful Win32 call.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a valid owned process handle that is not managed or
+    /// closed by any other owner.
+    pub(crate) unsafe fn from_owned(handle: HANDLE) -> Self {
+        Self(handle)
+    }
+
     pub(crate) fn raw(&self) -> HANDLE {
         self.0
     }

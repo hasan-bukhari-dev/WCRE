@@ -4,13 +4,16 @@
 //! Unsafe Win32 interaction should remain isolated here rather than leaking
 //! into higher-level engine or CLI code.
 //!
-//! No process restoration functionality is implemented yet.
+//! Early restoration primitives are intentionally narrow and do not yet constitute complete process restoration.
 
 mod exact_allocation;
+mod loader_debug;
 mod memory;
 mod memory_read;
 mod process;
+mod restore_memory;
 mod snapshot;
+mod suspended_process;
 
 pub use memory::{
     MemoryMap, MemoryProtection, MemoryRegion, MemoryState, MemoryType, query_memory_map,
@@ -27,6 +30,13 @@ pub use memory_read::{
 
 pub use process::{ProcessArchitecture, ProcessInfo, inspect_process};
 
+pub use restore_memory::{RemoteMemoryError, RemoteMemorySession};
+
+pub use loader_debug::{
+    LoaderDebugError, LoaderDebugSession, LoaderEntryPointBreakpoint, LoaderInitialBreakpoint,
+};
+pub use suspended_process::{SuspendedProcessError, SuspendedProcessSession};
+
 pub use snapshot::{
     SnapshotImage, SnapshotImageReport, SnapshotMemoryComparison, SnapshotPrivateDiff,
     SnapshotPrivateRegionChange, SnapshotProbeReport, SnapshotThread, SnapshotThreadReport,
@@ -37,7 +47,7 @@ pub use snapshot::{
 };
 
 pub const PROJECT_NAME: &str = "WCRE";
-pub const CURRENT_MILESTONE: &str = "M2 - Memory Restoration Research";
+pub const CURRENT_MILESTONE: &str = "M3 - Thread Restoration Research";
 
 #[cfg(test)]
 mod tests {
