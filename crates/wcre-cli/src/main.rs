@@ -118,6 +118,11 @@ fn run() -> Result<(), String> {
             run_snapshot_private_diff(pid)
         }
 
+        Some("create-event-probe") => {
+            let (path, addresses) = parse_inspect_checkpoint_arguments(args.collect())?;
+            run_create_event_probe(&path, &addresses)
+        }
+
         Some("suspended-probe") => {
             let (path, addresses) = parse_inspect_checkpoint_arguments(args.collect())?;
             run_suspended_probe(&path, &addresses)
@@ -1899,6 +1904,125 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+fn run_create_event_probe(path: &str, addresses: &[u64]) -> Result<(), String> {
+    let checkpoint =
+        read_checkpoint_file(path).map_err(|error| format!("failed to read '{path}': {error}"))?;
+
+    let executable = checkpoint.process.image_path.clone();
+
+    println!("WCRE CREATE_PROCESS_DEBUG_EVENT Probe");
+    println!();
+    println!("{:<32}{}", "Checkpoint:", path);
+    println!("{:<32}{}", "Captured PID:", checkpoint.process.captured_pid);
+    println!("{:<32}{}", "Captured executable:", executable);
+    println!("{:<32}{}", "Addresses requested:", addresses.len());
+    println!();
+
+    println!("Creating destination under DEBUG_ONLY_THIS_PROCESS...");
+    println!();
+
+    let mut session = LoaderDebugSession::create_at_process_event(&executable)
+        .map_err(|error| format!("failed to reach CREATE_PROCESS_DEBUG_EVENT: {error}"))?;
+
+    let pid = session.process_id();
+    let primary_tid = session.primary_thread_id();
+    let initial = session.initial_breakpoint();
+
+    println!("CREATE_PROCESS_DEBUG_EVENT staging");
+    println!("----------------------------------");
+    println!("{:<32}{}", "Destination PID:", pid);
+    println!("{:<32}{}", "Primary TID:", primary_tid);
+    println!("{:<32}0x{:016X}", "Image base:", session.image_base());
+    println!(
+        "{:<32}{}",
+        "Debug events seen:",
+        session.debug_events_seen()
+    );
+    println!("{:<32}{}", "LOAD_DLL events:", session.load_dll_events());
+    println!(
+        "{:<32}{}",
+        "Initial breakpoint reached:",
+        yes_no(initial.address != 0)
+    );
+    println!("{:<32}{}", "Application released:", "NO");
+    println!();
+
+    if session.debug_events_seen() != 1 {
+        return Err(format!(
+            "expected 1 debug event, observed {}",
+            session.debug_events_seen()
+        ));
+    }
+
+    if session.load_dll_events() != 0 {
+        return Err(format!(
+            "expected 0 LOAD_DLL events, observed {}",
+            session.load_dll_events()
+        ));
+    }
+
+    if initial.address != 0 {
+        return Err(format!(
+            "initial breakpoint unexpectedly reached at 0x{:016X}",
+            initial.address
+        ));
+    }
+
+    println!("Checkpoint address availability");
+    println!("-------------------------------");
+
+    let mut free_addresses = 0usize;
+
+    for &address in addresses {
+        let address_usize = usize::try_from(address)
+            .map_err(|_| format!("address 0x{address:016X} does not fit usize"))?;
+
+        let region = query_memory_region(pid, address_usize).map_err(|error| {
+            format!(
+                "failed to query CREATE_PROCESS-stage PID {pid} \
+                         at 0x{address:016X}: {error}"
+            )
+        })?;
+
+        if matches!(region.state, Win32MemoryState::Free) {
+            free_addresses += 1;
+        }
+
+        println!(
+            "0x{:016X}  {:<8} {:<8} {:<18} region=0x{:016X}-0x{:016X}",
+            address,
+            region.state,
+            region.kind,
+            region.protection,
+            region.base_address,
+            region.end_address()
+        );
+    }
+
+    println!();
+    println!("{:<32}{}", "Addresses checked:", addresses.len());
+    println!("{:<32}{}", "Addresses free:", free_addresses);
+    println!(
+        "{:<32}{}",
+        "All requested addresses free:",
+        yes_no(free_addresses == addresses.len())
+    );
+
+    println!();
+    println!("Cleanup");
+    println!("-------");
+
+    session.terminate().map_err(|error| {
+        format!("failed to terminate CREATE_PROCESS-stage destination: {error}")
+    })?;
+
+    println!("{:<32}{}", "Process terminated:", "YES");
+    println!("{:<32}{}", "CREATE_PROCESS event continued:", "NO");
+    println!("{:<32}{}", "Captured execution resumed:", "NO");
+
+    Ok(())
+}
+
 fn run_entry_probe(path: &str, addresses: &[u64]) -> Result<(), String> {
     let checkpoint =
         read_checkpoint_file(path).map_err(|error| format!("failed to read '{path}': {error}"))?;
@@ -2508,6 +2632,7 @@ fn print_help() {
     println!("  wcre-cli snapshot-threads --pid <PID>");
     println!("  wcre-cli snapshot-verify --pid <PID>");
     println!("  wcre-cli snapshot-private-diff --pid <PID>");
+    println!("  wcre-cli create-event-probe <FILE.wcr> [--address <HEX> ...]");
     println!("  wcre-cli suspended-probe <FILE.wcr> [--address <HEX> ...]");
     println!("  wcre-cli loader-probe <FILE.wcr> [--address <HEX> ...]");
     println!("  wcre-cli entry-probe <FILE.wcr> [--address <HEX> ...]");
