@@ -7,6 +7,7 @@
 //! Early restoration primitives are intentionally narrow and do not yet constitute complete process restoration.
 
 mod exact_allocation;
+mod loader_debug;
 mod memory;
 mod memory_read;
 mod process;
@@ -31,6 +32,7 @@ pub use process::{ProcessArchitecture, ProcessInfo, inspect_process};
 
 pub use restore_memory::{RemoteMemoryError, RemoteMemorySession};
 
+pub use loader_debug::{LoaderDebugError, LoaderDebugSession, LoaderInitialBreakpoint};
 pub use suspended_process::{SuspendedProcessError, SuspendedProcessSession};
 
 pub use snapshot::{

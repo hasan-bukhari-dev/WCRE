@@ -8,12 +8,13 @@ use wcre_image::{
 };
 
 use wcre_win32::{
-    ExactAddressSpaceSession, ExactAllocationError, MemoryState as Win32MemoryState,
-    MemoryTypeReadSummary, ProcessArchitecture, RemoteMemorySession, SuspendedProcessSession,
-    capture_checkpoint_model, capture_image_inventory, capture_snapshot_probe,
-    capture_thread_contexts, capture_thread_state_validation, capture_va_clone,
-    compare_va_clone_memory, diff_va_clone_private_memory, inspect_process, query_memory_map,
-    query_memory_region, read_process_memory,
+    ExactAddressSpaceSession, ExactAllocationError, LoaderDebugSession,
+    MemoryState as Win32MemoryState, MemoryTypeReadSummary, ProcessArchitecture,
+    RemoteMemorySession, SuspendedProcessSession, capture_checkpoint_model,
+    capture_image_inventory, capture_snapshot_probe, capture_thread_contexts,
+    capture_thread_state_validation, capture_va_clone, compare_va_clone_memory,
+    diff_va_clone_private_memory, inspect_process, query_memory_map, query_memory_region,
+    read_process_memory,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +121,11 @@ fn run() -> Result<(), String> {
         Some("suspended-probe") => {
             let (path, addresses) = parse_inspect_checkpoint_arguments(args.collect())?;
             run_suspended_probe(&path, &addresses)
+        }
+
+        Some("loader-probe") => {
+            let (path, addresses) = parse_inspect_checkpoint_arguments(args.collect())?;
+            run_loader_probe(&path, &addresses)
         }
 
         Some("-h") | Some("--help") | None => {
@@ -1888,6 +1894,212 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+fn run_loader_probe(path: &str, addresses: &[u64]) -> Result<(), String> {
+    let checkpoint =
+        read_checkpoint_file(path).map_err(|error| format!("failed to read '{path}': {error}"))?;
+
+    let executable = checkpoint.process.image_path.clone();
+
+    println!("WCRE Loader-Staged Restore Probe");
+    println!();
+    println!("{:<30}{}", "Checkpoint:", path);
+    println!("{:<30}{}", "Captured PID:", checkpoint.process.captured_pid);
+    println!(
+        "{:<30}{:?}",
+        "Captured architecture:", checkpoint.process.architecture
+    );
+    println!("{:<30}{}", "Captured executable:", executable);
+    println!("{:<30}{}", "Captured images:", checkpoint.images.len());
+
+    println!();
+    println!("Creating destination under DEBUG_ONLY_THIS_PROCESS...");
+    println!();
+
+    let mut session = LoaderDebugSession::create_at_initial_breakpoint(&executable)
+        .map_err(|error| format!("failed to reach loader breakpoint: {error}"))?;
+
+    let pid = session.process_id();
+    let primary_tid = session.primary_thread_id();
+    let breakpoint = session.initial_breakpoint();
+
+    println!("Loader staging");
+    println!("--------------");
+    println!("{:<30}{}", "Destination PID:", pid);
+    println!("{:<30}{}", "Primary TID:", primary_tid);
+    println!("{:<30}0x{:016X}", "Image base:", session.image_base());
+    println!("{:<30}{}", "Debug events:", session.debug_events_seen());
+    println!("{:<30}{}", "LOAD_DLL events:", session.load_dll_events());
+    println!("{:<30}{}", "Breakpoint TID:", breakpoint.thread_id);
+    println!("{:<30}0x{:016X}", "Breakpoint address:", breakpoint.address);
+    println!("{:<30}{}", "First chance:", yes_no(breakpoint.first_chance));
+    println!("{:<30}{}", "Session active:", yes_no(session.is_active()));
+    println!("{:<30}{}", "Application released:", "NO");
+
+    let process = inspect_process(pid)
+        .map_err(|error| format!("failed to inspect loader-stage PID {pid}: {error}"))?;
+
+    println!();
+    println!("Process identity");
+    println!("----------------");
+    println!("{:<30}{}", "Image:", process.image_path.display());
+    println!("{:<30}{}", "Architecture:", process.architecture);
+    println!(
+        "{:<30}{}",
+        "Native architecture:", process.native_architecture
+    );
+
+    let map = query_memory_map(pid)
+        .map_err(|error| format!("failed to query loader-stage memory for PID {pid}: {error}"))?;
+
+    println!();
+    println!("Virtual-memory summary");
+    println!("----------------------");
+    println!("{:<30}{}", "Regions:", map.regions.len());
+    println!("{:<30}{}", "Committed:", format_size(map.committed_bytes));
+    println!("{:<30}{}", "Reserved:", format_size(map.reserved_bytes));
+    println!("{:<30}{}", "Private:", format_size(map.private_bytes));
+    println!("{:<30}{}", "Mapped:", format_size(map.mapped_bytes));
+    println!("{:<30}{}", "Image:", format_size(map.image_bytes));
+
+    if !addresses.is_empty() {
+        println!();
+        println!("Checkpoint-address availability");
+        println!("-------------------------------");
+
+        for &address in addresses {
+            let address_usize = usize::try_from(address)
+                .map_err(|_| format!("address 0x{address:016X} does not fit usize"))?;
+
+            let region = query_memory_region(pid, address_usize).map_err(|error| {
+                format!("failed to query loader-stage PID {pid} at 0x{address:016X}: {error}")
+            })?;
+
+            println!(
+                "0x{:016X}  {:<8} {:<8} {:<18} region=0x{:016X}-0x{:016X}",
+                address,
+                region.state,
+                region.kind,
+                region.protection,
+                region.base_address,
+                region.end_address()
+            );
+        }
+    }
+
+    println!();
+    println!("Loader-stage image inventory");
+    println!("----------------------------");
+
+    let images = capture_image_inventory(pid)
+        .map_err(|error| format!("failed to capture loader-stage image inventory: {error}"))?;
+
+    println!("{:<30}{}", "Loaded images:", images.images.len());
+    println!();
+    println!("{:<18} {:>10}  {}", "Loaded base", "Size", "Path");
+
+    for image in &images.images {
+        println!(
+            "{:016X}  {:>10}  {}",
+            image.loaded_base,
+            format_size(image.size_of_image as u64),
+            image.mapped_path.as_deref().unwrap_or("<unavailable>")
+        );
+    }
+
+    println!();
+    println!("Checkpoint image compatibility");
+    println!("------------------------------");
+
+    let mut exact_base_matches = 0usize;
+
+    for captured in &checkpoint.images {
+        let staged = images
+            .images
+            .iter()
+            .find(|image| image.loaded_base as u64 == captured.loaded_base);
+
+        match staged {
+            Some(staged) => {
+                exact_base_matches += 1;
+
+                println!(
+                    "MATCH   0x{:016X}  captured={}  staged={}",
+                    captured.loaded_base,
+                    captured.mapped_path.as_deref().unwrap_or("<unavailable>"),
+                    staged.mapped_path.as_deref().unwrap_or("<unavailable>")
+                );
+            }
+
+            None => {
+                println!(
+                    "MISSING 0x{:016X}  {}",
+                    captured.loaded_base,
+                    captured.mapped_path.as_deref().unwrap_or("<unavailable>")
+                );
+            }
+        }
+    }
+
+    println!();
+    println!("{:<30}{}", "Captured image count:", checkpoint.images.len());
+    println!("{:<30}{}", "Exact-base matches:", exact_base_matches);
+    println!(
+        "{:<30}{}",
+        "All captured bases present:",
+        yes_no(exact_base_matches == checkpoint.images.len())
+    );
+
+    println!();
+    println!("Loader-stage thread context");
+    println!("---------------------------");
+
+    let threads = capture_thread_contexts(pid)
+        .map_err(|error| format!("failed to capture loader-stage threads: {error}"))?;
+
+    println!("{:<30}{}", "Thread entries:", threads.threads.len());
+
+    let primary = threads
+        .threads
+        .iter()
+        .find(|thread| thread.thread_id == primary_tid);
+
+    println!(
+        "{:<30}{}",
+        "Primary TID captured:",
+        yes_no(primary.is_some())
+    );
+
+    if let Some(thread) = primary {
+        println!("{:<30}{:016X}", "Primary TEB:", thread.teb_base_address);
+
+        if let Some(context) = &thread.context {
+            println!("{:<30}{:016X}", "Current RIP:", context.rip);
+            println!("{:<30}{:016X}", "Current RSP:", context.rsp);
+            println!("{:<30}{:016X}", "Current RBP:", context.rbp);
+        }
+    }
+
+    println!();
+    println!("Thread/TEB validation");
+    println!("---------------------");
+
+    run_snapshot_thread_validate(pid)?;
+
+    println!();
+    println!("Cleanup");
+    println!("-------");
+
+    session
+        .terminate()
+        .map_err(|error| format!("failed to terminate loader-stage process: {error}"))?;
+
+    println!("{:<30}{}", "Terminated:", "YES");
+    println!("{:<30}{}", "Application released:", "NO");
+    println!("{:<30}{}", "Captured context installed:", "NO");
+    println!("{:<30}{}", "Execution resumed:", "NO");
+
+    Ok(())
+}
 fn run_suspended_probe(path: &str, addresses: &[u64]) -> Result<(), String> {
     let checkpoint =
         read_checkpoint_file(path).map_err(|error| format!("failed to read '{path}': {error}"))?;
@@ -2069,6 +2281,7 @@ fn print_help() {
     println!("  wcre-cli snapshot-verify --pid <PID>");
     println!("  wcre-cli snapshot-private-diff --pid <PID>");
     println!("  wcre-cli suspended-probe <FILE.wcr> [--address <HEX> ...]");
+    println!("  wcre-cli loader-probe <FILE.wcr> [--address <HEX> ...]");
 }
 
 #[cfg(test)]
