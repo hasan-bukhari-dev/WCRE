@@ -9,11 +9,11 @@ use wcre_image::{
 
 use wcre_win32::{
     ExactAddressSpaceSession, ExactAllocationError, MemoryState as Win32MemoryState,
-    MemoryTypeReadSummary, ProcessArchitecture, RemoteMemorySession, capture_checkpoint_model,
-    capture_image_inventory, capture_snapshot_probe, capture_thread_contexts,
-    capture_thread_state_validation, capture_va_clone, compare_va_clone_memory,
-    diff_va_clone_private_memory, inspect_process, query_memory_map, query_memory_region,
-    read_process_memory,
+    MemoryTypeReadSummary, ProcessArchitecture, RemoteMemorySession, SuspendedProcessSession,
+    capture_checkpoint_model, capture_image_inventory, capture_snapshot_probe,
+    capture_thread_contexts, capture_thread_state_validation, capture_va_clone,
+    compare_va_clone_memory, diff_va_clone_private_memory, inspect_process, query_memory_map,
+    query_memory_region, read_process_memory,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +115,11 @@ fn run() -> Result<(), String> {
         Some("snapshot-private-diff") => {
             let pid = parse_pid_arguments(args.collect(), "snapshot-private-diff")?;
             run_snapshot_private_diff(pid)
+        }
+
+        Some("suspended-probe") => {
+            let (path, addresses) = parse_inspect_checkpoint_arguments(args.collect())?;
+            run_suspended_probe(&path, &addresses)
         }
 
         Some("-h") | Some("--help") | None => {
@@ -1883,10 +1888,168 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+fn run_suspended_probe(path: &str, addresses: &[u64]) -> Result<(), String> {
+    let checkpoint =
+        read_checkpoint_file(path).map_err(|error| format!("failed to read '{path}': {error}"))?;
+
+    let executable = checkpoint.process.image_path.clone();
+
+    println!("WCRE Suspended Restore Scaffold Probe");
+    println!();
+    println!("{:<28}{}", "Checkpoint:", path);
+    println!("{:<28}{}", "Captured PID:", checkpoint.process.captured_pid);
+    println!(
+        "{:<28}{:?}",
+        "Captured architecture:", checkpoint.process.architecture
+    );
+    println!("{:<28}{}", "Captured executable:", executable);
+    println!();
+    println!("Creating destination process with CREATE_SUSPENDED...");
+    println!();
+
+    let mut session = SuspendedProcessSession::create(&executable)
+        .map_err(|error| format!("failed to create suspended restore scaffold: {error}"))?;
+
+    let pid = session.process_id();
+    let primary_tid = session.primary_thread_id();
+
+    println!("Suspended scaffold");
+    println!("------------------");
+    println!("{:<28}{}", "Destination PID:", pid);
+    println!("{:<28}{}", "Primary TID:", primary_tid);
+    println!("{:<28}{}", "Session active:", yes_no(session.is_active()));
+    println!("{:<28}{}", "ResumeThread calls:", 0);
+    println!();
+
+    let process = inspect_process(pid)
+        .map_err(|error| format!("failed to inspect suspended PID {pid}: {error}"))?;
+
+    println!("Process identity");
+    println!("----------------");
+    println!("{:<28}{}", "Image:", process.image_path.display());
+    println!("{:<28}{}", "Architecture:", process.architecture);
+    println!(
+        "{:<28}{}",
+        "Native architecture:", process.native_architecture
+    );
+    println!();
+
+    let map = query_memory_map(pid).map_err(|error| {
+        format!("failed to query suspended virtual memory for PID {pid}: {error}")
+    })?;
+
+    println!("Virtual-memory summary");
+    println!("----------------------");
+    println!("{:<28}{}", "Regions:", map.regions.len());
+    println!("{:<28}{}", "Committed:", format_size(map.committed_bytes));
+    println!("{:<28}{}", "Reserved:", format_size(map.reserved_bytes));
+    println!("{:<28}{}", "Private:", format_size(map.private_bytes));
+    println!("{:<28}{}", "Mapped:", format_size(map.mapped_bytes));
+    println!("{:<28}{}", "Image:", format_size(map.image_bytes));
+
+    if !addresses.is_empty() {
+        println!();
+        println!("Checkpoint-address availability");
+        println!("-------------------------------");
+
+        for &address in addresses {
+            let address_usize = usize::try_from(address)
+                .map_err(|_| format!("address 0x{address:016X} does not fit usize"))?;
+
+            let region = query_memory_region(pid, address_usize).map_err(|error| {
+                format!("failed to query suspended PID {pid} at 0x{address:016X}: {error}")
+            })?;
+
+            println!(
+                "0x{:016X}  {:<8} {:<8} {:<18} region=0x{:016X}-0x{:016X}",
+                address,
+                region.state,
+                region.kind,
+                region.protection,
+                region.base_address,
+                region.end_address()
+            );
+        }
+    }
+
+    println!();
+    println!("PSS image inventory");
+    println!("-------------------");
+
+    let images = capture_image_inventory(pid)
+        .map_err(|error| format!("failed to inspect suspended image inventory: {error}"))?;
+
+    println!("{:<28}{}", "Loaded images:", images.images.len());
+    println!("{:<18} {:>10}  {}", "Loaded base", "Size", "Path");
+
+    for image in &images.images {
+        println!(
+            "{:016X}  {:>10}  {}",
+            image.loaded_base,
+            format_size(image.size_of_image as u64),
+            image.mapped_path.as_deref().unwrap_or("<unavailable>")
+        );
+    }
+
+    println!();
+    println!("Suspended thread context");
+    println!("------------------------");
+
+    let threads = capture_thread_contexts(pid)
+        .map_err(|error| format!("failed to capture suspended thread context: {error}"))?;
+
+    println!("{:<28}{}", "Thread entries:", threads.threads.len());
+
+    let primary = threads
+        .threads
+        .iter()
+        .find(|thread| thread.thread_id == primary_tid);
+
+    println!(
+        "{:<28}{}",
+        "Primary TID captured:",
+        yes_no(primary.is_some())
+    );
+
+    if let Some(thread) = primary {
+        println!("{:<28}{:016X}", "Primary TEB:", thread.teb_base_address);
+
+        match &thread.context {
+            Some(context) => {
+                println!("{:<28}{:016X}", "Initial RIP:", context.rip);
+                println!("{:<28}{:016X}", "Initial RSP:", context.rsp);
+                println!("{:<28}{:016X}", "Initial RBP:", context.rbp);
+            }
+            None => {
+                println!("{:<28}{}", "Initial context:", "<unavailable>");
+            }
+        }
+    }
+
+    println!();
+    println!("Thread/TEB validation");
+    println!("---------------------");
+
+    run_snapshot_thread_validate(pid)?;
+
+    println!();
+    println!("Cleanup");
+    println!("-------");
+
+    session
+        .terminate()
+        .map_err(|error| format!("failed to terminate suspended scaffold: {error}"))?;
+
+    println!("{:<28}{}", "Terminated suspended:", "YES");
+    println!("{:<28}{}", "ResumeThread invoked:", "NO");
+    println!("{:<28}{}", "Application released:", "NO");
+
+    Ok(())
+}
 fn print_help() {
     println!("WCRE - Windows Checkpoint/Restore Engine");
     println!("Version: 0.0.1-dev");
-    println!("Milestone: M1 - Exact VA Reconstruction Research");
+    println!("Milestone: M3 - Thread Restoration Research");
     println!();
 
     println!("Usage:");
@@ -1905,6 +2068,7 @@ fn print_help() {
     println!("  wcre-cli snapshot-threads --pid <PID>");
     println!("  wcre-cli snapshot-verify --pid <PID>");
     println!("  wcre-cli snapshot-private-diff --pid <PID>");
+    println!("  wcre-cli suspended-probe <FILE.wcr> [--address <HEX> ...]");
 }
 
 #[cfg(test)]
