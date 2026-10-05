@@ -123,6 +123,11 @@ fn run() -> Result<(), String> {
             run_create_event_probe(&path, &addresses)
         }
 
+        Some("fence-probe") => {
+            let path = parse_checkpoint_path(args.collect(), "fence-probe")?;
+            run_fence_probe(&path)
+        }
+
         Some("suspended-probe") => {
             let (path, addresses) = parse_inspect_checkpoint_arguments(args.collect())?;
             run_suspended_probe(&path, &addresses)
@@ -2023,6 +2028,336 @@ fn run_create_event_probe(path: &str, addresses: &[u64]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_fence_probe(path: &str) -> Result<(), String> {
+    let checkpoint =
+        read_checkpoint_file(path).map_err(|error| format!("failed to read '{path}': {error}"))?;
+
+    let plan = plan_address_space(&checkpoint)
+        .map_err(|error| format!("failed to plan checkpoint address space: {error}"))?;
+
+    let reservations = plan
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            AddressSpaceOperation::Reserve {
+                allocation_base,
+                size,
+                ..
+            } => Some((*allocation_base, *size)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if reservations.is_empty() {
+        return Err("restore plan contains no supported PRIVATE reservations".to_string());
+    }
+
+    let executable = checkpoint.process.image_path.clone();
+
+    println!("WCRE Checkpoint Address-Space Fencing Probe");
+    println!();
+    println!("{:<34}{}", "Checkpoint:", path);
+    println!("{:<34}{}", "Captured PID:", checkpoint.process.captured_pid);
+    println!("{:<34}{}", "Captured executable:", executable);
+    println!("{:<34}{}", "Captured images:", checkpoint.images.len());
+    println!("{:<34}{}", "Planned reservations:", reservations.len());
+    println!(
+        "{:<34}{}",
+        "Planned reservation bytes:",
+        format_size(plan.reservation_bytes)
+    );
+    println!();
+
+    println!("Creating destination at CREATE_PROCESS_DEBUG_EVENT...");
+    println!();
+
+    let mut debug_session = LoaderDebugSession::create_at_process_event(&executable)
+        .map_err(|error| format!("failed to reach CREATE_PROCESS_DEBUG_EVENT: {error}"))?;
+
+    let pid = debug_session.process_id();
+
+    println!("Early debugger staging");
+    println!("----------------------");
+    println!("{:<34}{}", "Destination PID:", pid);
+    println!(
+        "{:<34}0x{:016X}",
+        "Destination image base:",
+        debug_session.image_base()
+    );
+    println!(
+        "{:<34}{}",
+        "Debug events seen:",
+        debug_session.debug_events_seen()
+    );
+    println!(
+        "{:<34}{}",
+        "LOAD_DLL events:",
+        debug_session.load_dll_events()
+    );
+    println!(
+        "{:<34}{}",
+        "Initial breakpoint reached:",
+        yes_no(debug_session.initial_breakpoint().address != 0)
+    );
+    println!("{:<34}{}", "Application released:", "NO");
+
+    if debug_session.debug_events_seen() != 1 {
+        return Err(format!(
+            "expected exactly one debug event before fencing, observed {}",
+            debug_session.debug_events_seen()
+        ));
+    }
+
+    if debug_session.load_dll_events() != 0 {
+        return Err(format!(
+            "expected zero LOAD_DLL events before fencing, observed {}",
+            debug_session.load_dll_events()
+        ));
+    }
+
+    if debug_session.initial_breakpoint().address != 0 {
+        return Err("initial breakpoint was reached before fencing".to_string());
+    }
+
+    println!();
+    println!("Claiming checkpoint reservations");
+    println!("-------------------------------");
+
+    let mut address_session = ExactAddressSpaceSession::open(pid)
+        .map_err(|error| format!("failed to open destination exact-address session: {error}"))?;
+
+    for &(base, size) in &reservations {
+        print!("FENCE   0x{base:016X} size=0x{size:X} ... ");
+
+        match address_session.reserve_exact(base, size) {
+            Ok(_) => println!("EXACT"),
+            Err(error) => {
+                return Err(format!(
+                    "checkpoint fence 0x{base:016X} + 0x{size:X} failed: {error}"
+                ));
+            }
+        }
+    }
+
+    let verify_fences =
+        |address_session: &ExactAddressSpaceSession, stage: &str| -> Result<(), String> {
+            println!();
+            println!("{stage} fence verification");
+            println!("{}", "-".repeat(stage.len() + 19));
+
+            let mut verified = 0usize;
+
+            for &(base, size) in &reservations {
+                let observed = address_session.query(base).map_err(|error| {
+                    format!(
+                        "{stage}: failed to query fence \
+                             0x{base:016X}: {error}"
+                    )
+                })?;
+
+                let expected_size = usize::try_from(size).unwrap_or(usize::MAX);
+
+                let exact = observed.base_address as u64 == base
+                    && observed.allocation_base as u64 == base
+                    && observed.state == Win32MemoryState::Reserve
+                    && observed.region_size >= expected_size;
+
+                println!(
+                    "0x{base:016X} size=0x{size:X} \
+                 state={} allocation=0x{:016X} region=0x{:016X}-0x{:016X} {}",
+                    observed.state,
+                    observed.allocation_base,
+                    observed.base_address,
+                    observed.end_address(),
+                    if exact { "VERIFIED" } else { "MISMATCH" }
+                );
+
+                if !exact {
+                    return Err(format!(
+                        "{stage}: fence verification mismatch at \
+                     0x{base:016X}: {observed:?}"
+                    ));
+                }
+
+                verified += 1;
+            }
+
+            println!();
+            println!("{:<34}{}", "Fences expected:", reservations.len());
+            println!("{:<34}{}", "Fences verified:", verified);
+            println!(
+                "{:<34}{}",
+                "All fences exact:",
+                yes_no(verified == reservations.len())
+            );
+
+            Ok(())
+        };
+
+    verify_fences(&address_session, "CREATE_PROCESS_DEBUG_EVENT")?;
+
+    println!();
+    println!("Advancing Windows loader to initial breakpoint...");
+    println!();
+
+    debug_session
+        .advance_to_initial_breakpoint()
+        .map_err(|error| format!("loader failed while checkpoint fences were active: {error}"))?;
+
+    let initial = debug_session.initial_breakpoint();
+
+    println!("Initial debugger breakpoint");
+    println!("---------------------------");
+    println!("{:<34}0x{:016X}", "Breakpoint address:", initial.address);
+    println!(
+        "{:<34}{}",
+        "Debug events total:",
+        debug_session.debug_events_seen()
+    );
+    println!(
+        "{:<34}{}",
+        "LOAD_DLL events:",
+        debug_session.load_dll_events()
+    );
+    println!("{:<34}{}", "Application executed:", "NO");
+
+    verify_fences(&address_session, "INITIAL BREAKPOINT")?;
+
+    println!();
+    println!("Advancing loader to executable entry point...");
+    println!();
+
+    let entry = debug_session.stage_to_entry_point().map_err(|error| {
+        format!(
+            "entry-point staging failed while checkpoint fences \
+                     were active: {error}"
+        )
+    })?;
+
+    println!("Executable entry-point staging");
+    println!("------------------------------");
+    println!("{:<34}0x{:08X}", "Entry-point RVA:", entry.rva);
+    println!("{:<34}0x{:016X}", "Entry-point address:", entry.address);
+    println!(
+        "{:<34}{}",
+        "Debug events total:",
+        debug_session.debug_events_seen()
+    );
+    println!(
+        "{:<34}{}",
+        "LOAD_DLL events total:",
+        debug_session.load_dll_events()
+    );
+    println!("{:<34}{}", "Original entry byte restored:", "YES");
+    println!("{:<34}{}", "Entry instruction executed:", "NO");
+
+    verify_fences(&address_session, "ENTRY POINT")?;
+
+    println!();
+    println!("Entry-stage image compatibility");
+    println!("-------------------------------");
+
+    let images = capture_image_inventory(pid)
+        .map_err(|error| format!("failed to capture fenced entry-stage images: {error}"))?;
+
+    let mut exact_base_matches = 0usize;
+
+    for captured in &checkpoint.images {
+        let staged = images
+            .images
+            .iter()
+            .find(|image| image.loaded_base as u64 == captured.loaded_base);
+
+        match staged {
+            Some(staged) => {
+                exact_base_matches += 1;
+
+                println!(
+                    "MATCH   0x{:016X}  {}",
+                    captured.loaded_base,
+                    staged.mapped_path.as_deref().unwrap_or("<unavailable>")
+                );
+            }
+
+            None => {
+                println!(
+                    "MISSING 0x{:016X}  {}",
+                    captured.loaded_base,
+                    captured.mapped_path.as_deref().unwrap_or("<unavailable>")
+                );
+            }
+        }
+    }
+
+    println!();
+    println!("{:<34}{}", "Entry-stage images:", images.images.len());
+    println!("{:<34}{}", "Captured image count:", checkpoint.images.len());
+    println!("{:<34}{}", "Exact-base matches:", exact_base_matches);
+    println!(
+        "{:<34}{}",
+        "All captured bases present:",
+        yes_no(exact_base_matches == checkpoint.images.len())
+    );
+
+    if exact_base_matches != checkpoint.images.len() {
+        return Err(format!(
+            "only {exact_base_matches}/{} captured image bases \
+             survived checkpoint fencing",
+            checkpoint.images.len()
+        ));
+    }
+
+    println!();
+    println!("Controlled cleanup");
+    println!("------------------");
+
+    address_session
+        .release_all()
+        .map_err(|error| format!("failed to release checkpoint fences: {error}"))?;
+
+    let mut released = 0usize;
+
+    for &(base, _) in &reservations {
+        let base_usize = usize::try_from(base)
+            .map_err(|_| format!("cleanup address 0x{base:016X} does not fit usize"))?;
+
+        let observed = query_memory_region(pid, base_usize).map_err(|error| {
+            format!(
+                "failed to verify released fence \
+                         0x{base:016X}: {error}"
+            )
+        })?;
+
+        if observed.state != Win32MemoryState::Free {
+            return Err(format!(
+                "released checkpoint fence 0x{base:016X} \
+                 is not free: {observed:?}"
+            ));
+        }
+
+        released += 1;
+    }
+
+    println!("{:<34}{}", "Fences released:", released);
+
+    debug_session
+        .terminate()
+        .map_err(|error| format!("failed to terminate fenced destination: {error}"))?;
+
+    println!("{:<34}{}", "Destination terminated:", "YES");
+    println!("{:<34}{}", "Payloads installed:", "NO");
+    println!("{:<34}{}", "Captured context installed:", "NO");
+    println!("{:<34}{}", "Captured execution resumed:", "NO");
+
+    println!();
+    println!(
+        "Checkpoint address-space fencing survived Windows loader \
+         initialization through executable entry staging."
+    );
+
+    Ok(())
+}
+
 fn run_entry_probe(path: &str, addresses: &[u64]) -> Result<(), String> {
     let checkpoint =
         read_checkpoint_file(path).map_err(|error| format!("failed to read '{path}': {error}"))?;
@@ -2633,6 +2968,7 @@ fn print_help() {
     println!("  wcre-cli snapshot-verify --pid <PID>");
     println!("  wcre-cli snapshot-private-diff --pid <PID>");
     println!("  wcre-cli create-event-probe <FILE.wcr> [--address <HEX> ...]");
+    println!("  wcre-cli fence-probe <FILE.wcr>");
     println!("  wcre-cli suspended-probe <FILE.wcr> [--address <HEX> ...]");
     println!("  wcre-cli loader-probe <FILE.wcr> [--address <HEX> ...]");
     println!("  wcre-cli entry-probe <FILE.wcr> [--address <HEX> ...]");
