@@ -10,6 +10,7 @@ mod exact_allocation;
 mod memory;
 mod memory_read;
 mod process;
+mod restore_memory;
 mod snapshot;
 
 pub use memory::{
@@ -26,6 +27,8 @@ pub use memory_read::{
 };
 
 pub use process::{ProcessArchitecture, ProcessInfo, inspect_process};
+
+pub use restore_memory::{RemoteMemoryError, RemoteMemorySession};
 
 pub use snapshot::{
     SnapshotImage, SnapshotImageReport, SnapshotMemoryComparison, SnapshotPrivateDiff,

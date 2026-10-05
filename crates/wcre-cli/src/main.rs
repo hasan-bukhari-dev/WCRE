@@ -9,10 +9,11 @@ use wcre_image::{
 
 use wcre_win32::{
     ExactAddressSpaceSession, ExactAllocationError, MemoryState as Win32MemoryState,
-    MemoryTypeReadSummary, ProcessArchitecture, capture_checkpoint_model, capture_image_inventory,
-    capture_snapshot_probe, capture_thread_contexts, capture_thread_state_validation,
-    capture_va_clone, compare_va_clone_memory, diff_va_clone_private_memory, inspect_process,
-    query_memory_map, query_memory_region, read_process_memory,
+    MemoryTypeReadSummary, ProcessArchitecture, RemoteMemorySession, capture_checkpoint_model,
+    capture_image_inventory, capture_snapshot_probe, capture_thread_contexts,
+    capture_thread_state_validation, capture_va_clone, compare_va_clone_memory,
+    diff_va_clone_private_memory, inspect_process, query_memory_map, query_memory_region,
+    read_process_memory,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -845,9 +846,16 @@ fn run_reconstruct_address_space(arguments: &ReconstructionArguments) -> Result<
 
     let mut session = ExactAddressSpaceSession::open(arguments.host_pid)
         .map_err(|error| format!("failed to open exact-allocation session: {error}"))?;
+    let memory_session = RemoteMemorySession::open(arguments.host_pid)
+        .map_err(|error| format!("failed to open remote-memory session: {error}"))?;
+
     let mut reconstructed = Vec::new();
     let mut conflicts = Vec::new();
     let mut committed_ranges = 0usize;
+    let mut payload_ranges = 0usize;
+    let mut payload_bytes = 0usize;
+    let mut payloadless_ranges = 0usize;
+    let mut protected_ranges = 0usize;
 
     for requested in &arguments.allocation_bases {
         let (size, commits) = plan
@@ -939,6 +947,68 @@ fn run_reconstruct_address_space(arguments: &ReconstructionArguments) -> Result<
                 "  COMMIT 0x{:016X}-0x{requested_end:016X} ... EXACT",
                 region.base_address
             );
+
+            if region.payload_id.is_some() {
+                let bytes = memory_session
+                    .install_region_payload_verified(&checkpoint, region)
+                    .map_err(|error| {
+                        format!(
+                            "payload installation failed for 0x{:016X} + 0x{:X}: {error}",
+                            region.base_address, region.region_size
+                        )
+                    })?;
+
+                println!(
+                    "    PAYLOAD 0x{:016X}-0x{requested_end:016X} bytes={bytes} ... VERIFIED",
+                    region.base_address
+                );
+
+                payload_ranges += 1;
+                payload_bytes = payload_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| "verified payload byte count overflowed usize".to_string())?;
+            } else {
+                println!(
+                    "    PAYLOAD 0x{:016X}-0x{requested_end:016X} ... NOT CAPTURED",
+                    region.base_address
+                );
+
+                payloadless_ranges += 1;
+            }
+
+            let previous_protection = session
+                .restore_protection_exact(
+                    region.base_address,
+                    region.region_size,
+                    region.protection.raw,
+                )
+                .map_err(|error| {
+                    format!(
+                        "protection restoration failed for 0x{:016X} + 0x{:X}: {error}",
+                        region.base_address, region.region_size
+                    )
+                })?;
+
+            let observed_protected = session.query(region.base_address).map_err(|error| {
+                format!(
+                    "failed to verify restored protection at 0x{:016X}: {error}",
+                    region.base_address
+                )
+            })?;
+
+            if observed_protected.protection.0 != region.protection.raw {
+                return Err(format!(
+                    "protection verification mismatch at 0x{:016X}: expected 0x{:08X}, observed 0x{:08X}",
+                    region.base_address, region.protection.raw, observed_protected.protection.0
+                ));
+            }
+
+            println!(
+                "    PROTECT 0x{:016X}-0x{requested_end:016X} 0x{previous_protection:08X} -> 0x{:08X} ... VERIFIED",
+                region.base_address, region.protection.raw
+            );
+
+            protected_ranges += 1;
             committed_ranges += 1;
         }
 
@@ -950,6 +1020,10 @@ fn run_reconstruct_address_space(arguments: &ReconstructionArguments) -> Result<
     println!("----------------------");
     println!("{:<28}{}", "Exact reservations:", reconstructed.len());
     println!("{:<28}{}", "Exact committed ranges:", committed_ranges);
+    println!("{:<28}{}", "Verified payload ranges:", payload_ranges);
+    println!("{:<28}{}", "Verified payload bytes:", payload_bytes);
+    println!("{:<28}{}", "Payloadless ranges:", payloadless_ranges);
+    println!("{:<28}{}", "Verified protection ranges:", protected_ranges);
     println!("{:<28}{}", "Address conflicts:", conflicts.len());
 
     for (base, size, error) in &conflicts {
@@ -973,7 +1047,11 @@ fn run_reconstruct_address_space(arguments: &ReconstructionArguments) -> Result<
 
     println!("{:<28}VERIFIED", "Temporary cleanup:");
     println!();
-    println!("No checkpoint payload bytes or thread contexts were installed.");
+    println!("Captured payload bytes were installed and byte-for-byte verified.");
+    println!(
+        "Supported captured memory protections were restored and verified before temporary cleanup."
+    );
+    println!("Thread contexts were not installed.");
     println!("No captured execution was resumed.");
 
     if reconstructed.is_empty() {
