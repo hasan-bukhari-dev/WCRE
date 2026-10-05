@@ -32,7 +32,9 @@ pub use process::{ProcessArchitecture, ProcessInfo, inspect_process};
 
 pub use restore_memory::{RemoteMemoryError, RemoteMemorySession};
 
-pub use loader_debug::{LoaderDebugError, LoaderDebugSession, LoaderInitialBreakpoint};
+pub use loader_debug::{
+    LoaderDebugError, LoaderDebugSession, LoaderEntryPointBreakpoint, LoaderInitialBreakpoint,
+};
 pub use suspended_process::{SuspendedProcessError, SuspendedProcessSession};
 
 pub use snapshot::{
