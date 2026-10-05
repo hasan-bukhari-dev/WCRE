@@ -66,6 +66,8 @@ pub enum LoaderDebugError {
 
     MissingPendingDebugEvent,
 
+    InitialBreakpointNotReached,
+
     Io {
         operation: &'static str,
         error: std::io::Error,
@@ -118,14 +120,18 @@ impl fmt::Display for LoaderDebugError {
             }
 
             Self::MissingCreateProcessEvent => {
-                write!(
-                    f,
-                    "initial breakpoint arrived before a CREATE_PROCESS_DEBUG_EVENT"
-                )
+                write!(f, "debug event arrived before CREATE_PROCESS_DEBUG_EVENT")
             }
 
             Self::MissingPendingDebugEvent => {
                 write!(f, "loader-debug session has no pending debug event")
+            }
+
+            Self::InitialBreakpointNotReached => {
+                write!(
+                    f,
+                    "loader-debug session has not reached the initial debugger breakpoint"
+                )
             }
 
             Self::Io { operation, error } => {
@@ -214,16 +220,14 @@ pub struct LoaderDebugSession {
 }
 
 impl LoaderDebugSession {
-    /// Create a process under the Windows debugger and stop at the automatic
-    /// initial breakpoint.
+    /// Create a process under the Windows debugger and stop at its
+    /// CREATE_PROCESS_DEBUG_EVENT.
     ///
-    /// This function does NOT use CREATE_SUSPENDED.
-    ///
-    /// Windows loader execution advances only through explicit
-    /// ContinueDebugEvent calls performed by this function.
-    pub fn create_at_initial_breakpoint(
-        executable: impl AsRef<Path>,
-    ) -> Result<Self, LoaderDebugError> {
+    /// The create-process debug event is intentionally left pending. No
+    /// ContinueDebugEvent call has yet released the initial thread, so WCRE
+    /// can inspect or reserve destination virtual-address ranges before the
+    /// Windows loader continues startup.
+    pub fn create_at_process_event(executable: impl AsRef<Path>) -> Result<Self, LoaderDebugError> {
         let executable = executable.as_ref();
 
         if executable.as_os_str().is_empty() {
@@ -298,23 +302,34 @@ impl LoaderDebugSession {
             active: true,
         };
 
+        session.wait_for_create_process_event()?;
+
+        Ok(session)
+    }
+
+    /// Preserve the original public behavior: create the process, stop first
+    /// at CREATE_PROCESS_DEBUG_EVENT, then explicitly advance to Windows'
+    /// automatic initial debugger breakpoint.
+    pub fn create_at_initial_breakpoint(
+        executable: impl AsRef<Path>,
+    ) -> Result<Self, LoaderDebugError> {
+        let mut session = Self::create_at_process_event(executable)?;
+
         session.advance_to_initial_breakpoint()?;
 
         Ok(session)
     }
 
-    fn advance_to_initial_breakpoint(&mut self) -> Result<(), LoaderDebugError> {
-        let mut saw_create_process = false;
-
+    fn wait_for_create_process_event(&mut self) -> Result<(), LoaderDebugError> {
         loop {
             let mut event = DEBUG_EVENT::default();
 
             // SAFETY:
-            // event points to valid writable storage and this thread created the
-            // debugged process.
+            // event points to valid writable storage and this thread created
+            // the debugged process.
             unsafe { WaitForDebugEvent(&mut event, u32::MAX) }.map_err(|error| {
                 LoaderDebugError::Windows {
-                    operation: "WaitForDebugEvent",
+                    operation: "WaitForDebugEvent(CREATE_PROCESS_DEBUG_EVENT)",
                     error,
                 }
             })?;
@@ -327,16 +342,73 @@ impl LoaderDebugSession {
                 let info = unsafe { event.u.CreateProcessInfo };
 
                 self.image_base = info.lpBaseOfImage as usize;
-                saw_create_process = true;
 
-                // Windows requires the debugger to close the image-file handle.
+                // Windows requires the debugger to close the image-file
+                // handle supplied with this event.
                 if info.hFile != HANDLE::default() {
                     let _ = unsafe { CloseHandle(info.hFile) };
                 }
 
-                continue_event(&event)?;
-                continue;
+                // Deliberately DO NOT call ContinueDebugEvent here.
+                self.pending_debug_event = Some((event.dwProcessId, event.dwThreadId));
+
+                return Ok(());
             }
+
+            if event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT {
+                continue_event(&event)?;
+                self.active = false;
+
+                return Err(LoaderDebugError::ProcessExitedBeforeInitialBreakpoint);
+            }
+
+            // Fail closed. CREATE_PROCESS_DEBUG_EVENT should be the startup
+            // event we are looking for. Keeping an unexpected event pending
+            // ensures Drop/terminate cannot accidentally release application
+            // execution before WCRE understands the state.
+            self.pending_debug_event = Some((event.dwProcessId, event.dwThreadId));
+
+            return Err(LoaderDebugError::MissingCreateProcessEvent);
+        }
+    }
+
+    /// Continue the pending CREATE_PROCESS_DEBUG_EVENT and advance Windows
+    /// startup until the automatic initial debugger breakpoint.
+    ///
+    /// The resulting breakpoint event is left pending, preserving the
+    /// previous LoaderDebugSession behavior.
+    pub fn advance_to_initial_breakpoint(&mut self) -> Result<(), LoaderDebugError> {
+        if self.initial_breakpoint.address != 0 {
+            return Ok(());
+        }
+
+        let (process_id, thread_id) = self
+            .pending_debug_event
+            .take()
+            .ok_or(LoaderDebugError::MissingPendingDebugEvent)?;
+
+        let continue_result = unsafe { ContinueDebugEvent(process_id, thread_id, DBG_CONTINUE) };
+
+        if let Err(error) = continue_result {
+            self.pending_debug_event = Some((process_id, thread_id));
+
+            return Err(LoaderDebugError::Windows {
+                operation: "ContinueDebugEvent from CREATE_PROCESS_DEBUG_EVENT",
+                error,
+            });
+        }
+
+        loop {
+            let mut event = DEBUG_EVENT::default();
+
+            unsafe { WaitForDebugEvent(&mut event, u32::MAX) }.map_err(|error| {
+                LoaderDebugError::Windows {
+                    operation: "WaitForDebugEvent while advancing to initial breakpoint",
+                    error,
+                }
+            })?;
+
+            self.debug_events_seen += 1;
 
             if event.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT {
                 // SAFETY:
@@ -345,7 +417,20 @@ impl LoaderDebugSession {
 
                 self.load_dll_events += 1;
 
-                // Windows requires the debugger to close this file handle.
+                if info.hFile != HANDLE::default() {
+                    let _ = unsafe { CloseHandle(info.hFile) };
+                }
+
+                continue_event(&event)?;
+                continue;
+            }
+
+            if event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT {
+                // This should already have been consumed by
+                // create_at_process_event(), but close the file handle
+                // correctly and continue if Windows reports it again.
+                let info = unsafe { event.u.CreateProcessInfo };
+
                 if info.hFile != HANDLE::default() {
                     let _ = unsafe { CloseHandle(info.hFile) };
                 }
@@ -358,20 +443,15 @@ impl LoaderDebugSession {
                 // SAFETY:
                 // dwDebugEventCode identifies the active union member.
                 let info = unsafe { event.u.Exception };
-
                 let record = info.ExceptionRecord;
+
                 let code = record.ExceptionCode;
                 let address = record.ExceptionAddress as usize;
                 let first_chance = info.dwFirstChance != 0;
 
-                // This event remains pending until WCRE explicitly continues it.
                 self.pending_debug_event = Some((event.dwProcessId, event.dwThreadId));
 
                 if code == EXCEPTION_BREAKPOINT {
-                    if !saw_create_process {
-                        return Err(LoaderDebugError::MissingCreateProcessEvent);
-                    }
-
                     self.initial_breakpoint = LoaderInitialBreakpoint {
                         thread_id: event.dwThreadId,
                         address,
@@ -395,9 +475,8 @@ impl LoaderDebugSession {
                 return Err(LoaderDebugError::ProcessExitedBeforeInitialBreakpoint);
             }
 
-            // CREATE_THREAD, EXIT_THREAD, UNLOAD_DLL, OUTPUT_DEBUG_STRING,
-            // RIP_EVENT, and other non-exception events are not restoration
-            // decisions in this first research slice. Continue them.
+            // CREATE_THREAD, EXIT_THREAD, UNLOAD_DLL,
+            // OUTPUT_DEBUG_STRING, RIP_EVENT, etc.
             continue_event(&event)?;
         }
     }
@@ -415,6 +494,10 @@ impl LoaderDebugSession {
     pub fn stage_to_entry_point(&mut self) -> Result<LoaderEntryPointBreakpoint, LoaderDebugError> {
         if let Some(existing) = self.entry_point_breakpoint {
             return Ok(existing);
+        }
+
+        if self.initial_breakpoint.address == 0 {
+            return Err(LoaderDebugError::InitialBreakpointNotReached);
         }
 
         let entry_rva = read_pe_entry_point_rva(&self.executable)?;
@@ -814,6 +897,35 @@ mod tests {
     }
 
     #[test]
+    fn reaches_create_process_event_without_advancing_loader() {
+        let executable = std::env::current_exe().expect("test executable should exist");
+
+        let mut session = LoaderDebugSession::create_at_process_event(&executable)
+            .expect("debugged process should reach CREATE_PROCESS_DEBUG_EVENT");
+
+        assert_ne!(session.process_id(), 0);
+        assert_ne!(session.primary_thread_id(), 0);
+        assert_ne!(session.image_base(), 0);
+
+        // The constructor must return before loader/debugger startup has
+        // advanced to DLL events or the automatic breakpoint.
+        assert_eq!(session.debug_events_seen(), 1);
+        assert_eq!(session.load_dll_events(), 0);
+        assert_eq!(session.initial_breakpoint().address, 0);
+        assert_eq!(session.entry_point_breakpoint(), None);
+
+        assert!(session.pending_debug_event.is_some());
+        assert!(session.is_active());
+        assert_eq!(session.executable(), executable.as_path());
+
+        session
+            .terminate()
+            .expect("create-event-staged target should terminate");
+
+        assert!(!session.is_active());
+    }
+
+    #[test]
     fn reaches_initial_breakpoint_without_releasing_application() {
         let executable = std::env::current_exe().expect("test executable should exist");
 
@@ -831,6 +943,34 @@ mod tests {
         session
             .terminate()
             .expect("loader-debug target should terminate");
+
+        assert!(!session.is_active());
+    }
+
+    #[test]
+    fn entry_point_staging_rejects_create_process_event_state() {
+        let executable = std::env::current_exe().expect("test executable should exist");
+
+        let mut session = LoaderDebugSession::create_at_process_event(&executable)
+            .expect("debugged process should reach CREATE_PROCESS_DEBUG_EVENT");
+
+        let error = session
+            .stage_to_entry_point()
+            .expect_err("entry-point staging must require the initial breakpoint");
+
+        assert!(matches!(
+            error,
+            LoaderDebugError::InitialBreakpointNotReached
+        ));
+
+        assert_eq!(session.initial_breakpoint().address, 0);
+        assert_eq!(session.load_dll_events(), 0);
+        assert!(session.pending_debug_event.is_some());
+        assert!(session.is_active());
+
+        session
+            .terminate()
+            .expect("create-event-staged target should terminate");
 
         assert!(!session.is_active());
     }
