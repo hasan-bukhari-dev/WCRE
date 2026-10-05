@@ -3,8 +3,8 @@ use std::fmt;
 
 use windows::Win32::System::Memory::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-    PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, VirtualAllocEx,
-    VirtualFreeEx, VirtualProtectEx,
+    PAGE_GUARD, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE,
+    VirtualAllocEx, VirtualFreeEx, VirtualProtectEx,
 };
 use windows::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION};
 
@@ -409,7 +409,10 @@ fn validate_range(
 fn validate_private_protection(
     protection: u32,
 ) -> Result<PAGE_PROTECTION_FLAGS, ExactAllocationError> {
-    let supported = [
+    let has_guard = protection & PAGE_GUARD.0 != 0;
+    let base_protection = protection & !PAGE_GUARD.0;
+
+    let supported_base = [
         PAGE_NOACCESS.0,
         PAGE_READONLY.0,
         PAGE_READWRITE.0,
@@ -418,7 +421,9 @@ fn validate_private_protection(
         PAGE_EXECUTE_READWRITE.0,
     ];
 
-    if !supported.contains(&protection) {
+    if !supported_base.contains(&base_protection)
+        || (has_guard && base_protection == PAGE_NOACCESS.0)
+    {
         return Err(ExactAllocationError::UnsupportedProtection { protection });
     }
 
@@ -508,6 +513,37 @@ mod tests {
             .expect("protected region should query");
         assert_eq!(observed_protected.state, MemoryState::Commit);
         assert_eq!(observed_protected.protection.0, PAGE_READONLY.0);
+
+        let previous_protection = session
+            .restore_protection_exact(
+                base as u64,
+                WINDOWS_X64_PAGE_SIZE,
+                PAGE_READWRITE.0 | PAGE_GUARD.0,
+            )
+            .expect("PAGE_GUARD modifier should restore on supported PRIVATE protection");
+        assert_eq!(previous_protection, PAGE_READONLY.0);
+
+        let observed_guarded = session
+            .query(base as u64)
+            .expect("guarded region should query");
+        assert_eq!(observed_guarded.state, MemoryState::Commit);
+        assert_eq!(
+            observed_guarded.protection.0,
+            PAGE_READWRITE.0 | PAGE_GUARD.0
+        );
+
+        let invalid_guard_noaccess = session
+            .restore_protection_exact(
+                base as u64,
+                WINDOWS_X64_PAGE_SIZE,
+                PAGE_NOACCESS.0 | PAGE_GUARD.0,
+            )
+            .expect_err("PAGE_GUARD must not be accepted with PAGE_NOACCESS");
+        assert!(matches!(
+            invalid_guard_noaccess,
+            ExactAllocationError::UnsupportedProtection { protection }
+                if protection == (PAGE_NOACCESS.0 | PAGE_GUARD.0)
+        ));
 
         let unsupported = session
             .restore_protection_exact(base as u64, WINDOWS_X64_PAGE_SIZE, 0x08)
