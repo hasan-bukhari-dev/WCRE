@@ -6,7 +6,8 @@ use std::process::ExitCode;
 
 use wcre_image::{
     AddressSpaceOperation, CheckpointModel, MemoryKind, SkipReason, plan_address_space,
-    read_checkpoint_file, write_checkpoint_v1_file, write_checkpoint_v2_file,
+    read_checkpoint_file, select_unique_thread_in_image, write_checkpoint_v1_file,
+    write_checkpoint_v2_file,
 };
 
 use wcre_win32::{
@@ -2569,6 +2570,33 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
 
     let bootstrap = prepare_checkpoint_restore_bootstrap(&checkpoint)?;
 
+    let main_image = checkpoint
+        .images
+        .iter()
+        .find(|image| image.loaded_base == bootstrap.relocated_image_base)
+        .ok_or_else(|| {
+            format!(
+                "checkpoint does not contain main IMAGE at 0x{:016X}",
+                bootstrap.relocated_image_base
+            )
+        })?;
+
+    let selected_thread = select_unique_thread_in_image(&checkpoint, main_image)
+        .map_err(|error| format!("failed to select captured application thread: {error}"))?;
+
+    let selected_context = selected_thread
+        .context
+        .as_ref()
+        .expect("selected application thread necessarily has captured context");
+
+    let selected_stack_limit = selected_thread
+        .stack_limit
+        .expect("selected application thread necessarily has stack limit");
+
+    let selected_stack_base = selected_thread
+        .stack_base
+        .expect("selected application thread necessarily has stack base");
+
     println!("WCRE Staged Memory Restoration Probe");
     println!();
     println!("{:<36}{}", "Checkpoint:", path);
@@ -2596,6 +2624,28 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
         "ABSOLUTE relocations skipped:", bootstrap.absolute_entries_skipped
     );
     println!("{:<36}{}", "Captured images:", checkpoint.images.len());
+    println!();
+    println!("Captured application-thread selection");
+    println!("-------------------------------------");
+    println!(
+        "{:<36}{}",
+        "Selected captured TID:", selected_thread.thread_id
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "Captured TEB:", selected_thread.teb_base_address
+    );
+    println!("{:<36}0x{:016X}", "Captured RIP:", selected_context.rip);
+    println!("{:<36}0x{:016X}", "Captured RSP:", selected_context.rsp);
+    println!(
+        "{:<36}0x{:016X}-0x{:016X}",
+        "Captured stack:", selected_stack_limit, selected_stack_base
+    );
+    println!("{:<36}{}", "RIP owner:", "CAPTURED MAIN IMAGE");
+    println!("{:<36}{}", "Selection:", "UNIQUE");
+    println!("{:<36}{}", "Stack bounds:", "VALID");
+    println!("{:<36}{}", "Destination thread mapped:", "NO");
+    println!();
     println!("{:<36}{}", "Planned reservations:", reservations.len());
     println!("{:<36}{}", "Planned commits:", commits.len());
     println!(
@@ -2780,17 +2830,6 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
 
     let image_memory_session = RemoteMemorySession::open(pid)
         .map_err(|error| format!("failed to open IMAGE diagnostic memory session: {error}"))?;
-
-    let main_image = checkpoint
-        .images
-        .iter()
-        .find(|image| image.loaded_base == bootstrap.relocated_image_base)
-        .ok_or_else(|| {
-            format!(
-                "checkpoint does not contain main IMAGE at 0x{:016X}",
-                bootstrap.relocated_image_base
-            )
-        })?;
 
     let main_image_end = main_image.end_address();
 
