@@ -134,7 +134,7 @@ After payload installation and verification, WCRE can apply a supported captured
 VirtualProtectEx
 ```
 
-The initial PRIVATE restoration envelope currently accepts:
+The initial PRIVATE restoration envelope accepted:
 
 - `PAGE_NOACCESS`
 - `PAGE_READONLY`
@@ -143,7 +143,7 @@ The initial PRIVATE restoration envelope currently accepts:
 - `PAGE_EXECUTE_READ`
 - `PAGE_EXECUTE_READWRITE`
 
-The following remain deliberately unsupported in this first envelope:
+At the time of the initial Research 011 experiment, the following remained deliberately unsupported:
 
 - `PAGE_WRITECOPY`
 - `PAGE_EXECUTE_WRITECOPY`
@@ -183,6 +183,72 @@ The payload-restoration tests independently verify:
 - byte-for-byte verification,
 - missing payload-link rejection,
 - empty-operation rejection.
+
+---
+
+## Follow-up — Guard-Page Protection Restoration
+
+After the initial Research 011 result, WCRE extended the PRIVATE protection
+restoration envelope to support `PAGE_GUARD` as a modifier on supported base
+protections.
+
+This work is represented by commit:
+
+```text
+4cd51ac — Support guard-page protection restoration
+```
+
+The implementation separates the guard modifier from the base protection:
+
+```text
+captured protection
+        |
+        +--> PAGE_GUARD present?
+        |
+        v
+base protection
+```
+
+WCRE then validates the base protection against the already supported PRIVATE
+protection set.
+
+The follow-up accepts combinations such as:
+
+```text
+PAGE_READWRITE | PAGE_GUARD
+```
+
+and verifies the resulting remote protection through `VirtualQueryEx`.
+
+The Win32 test also verifies a real transition:
+
+```text
+PAGE_READONLY
+    ↓
+VirtualProtectEx
+    ↓
+PAGE_READWRITE | PAGE_GUARD
+    ↓
+VirtualQueryEx
+    ↓
+VERIFIED
+```
+
+The invalid combination:
+
+```text
+PAGE_NOACCESS | PAGE_GUARD
+```
+
+is rejected explicitly.
+
+`PAGE_WRITECOPY`, `PAGE_EXECUTE_WRITECOPY`, `PAGE_NOCACHE`,
+`PAGE_WRITECOMBINE`, and unsupported or unknown compound protection semantics
+remain outside the current controlled PRIVATE restoration envelope.
+
+This follow-up extends Research 011 rather than establishing a new restoration
+stage: WCRE is still restoring the same PRIVATE memory state class, but with a
+more complete representation of captured page-protection semantics.
 
 ---
 
@@ -296,6 +362,7 @@ WCRE can now, for the supported controlled PRIVATE-memory envelope:
 - verify them byte-for-byte,
 - apply a supported captured page protection,
 - verify the protection through Windows,
+- restore supported `PAGE_GUARD` combinations,
 - release the temporary reconstruction cleanly.
 
 The strongest defensible statement is:
@@ -372,6 +439,10 @@ Research 011 moves WCRE from address-space reconstruction to verified memory-sta
 Research 010 showed that WCRE could recreate **where** selected captured PRIVATE memory existed.
 
 Research 011 shows that WCRE can also recreate **what bytes were there** and **how supported pages were protected**.
+
+The later guard-page follow-up extends that protection fidelity to supported
+`PAGE_GUARD` combinations while preserving explicit rejection of unsupported
+semantics.
 
 The process is still not alive again.
 
