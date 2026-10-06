@@ -18,6 +18,7 @@ mod error;
 pub mod format;
 mod integrity;
 mod restore_plan;
+mod thread_selection;
 
 pub use decode::{read_checkpoint, read_checkpoint_file};
 pub use encode::{
@@ -29,6 +30,7 @@ pub use restore_plan::{
     AddressSpaceOperation, AddressSpacePlan, AddressSpacePlanError, PlannedRegion, SkipReason,
     SkippedRegion, WINDOWS_X64_ALLOCATION_GRANULARITY, WINDOWS_X64_PAGE_SIZE, plan_address_space,
 };
+pub use thread_selection::{ThreadSelectionError, select_unique_thread_in_image};
 
 /// Version of the in-memory WCRE checkpoint model.
 ///
