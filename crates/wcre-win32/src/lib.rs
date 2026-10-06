@@ -10,6 +10,7 @@ mod exact_allocation;
 mod loader_debug;
 mod memory;
 mod memory_read;
+mod pe_relocation;
 mod process;
 mod restore_memory;
 mod snapshot;
@@ -29,6 +30,8 @@ pub use memory_read::{
 };
 
 pub use process::{ProcessArchitecture, ProcessInfo, inspect_process};
+
+pub use pe_relocation::{PeRelocationError, RelocatedPeImage, prepare_relocated_pe_image};
 
 pub use restore_memory::{RemoteMemoryError, RemoteMemorySession};
 
