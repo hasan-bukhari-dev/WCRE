@@ -123,6 +123,11 @@ fn run() -> Result<(), String> {
             run_create_event_probe(&path, &addresses)
         }
 
+        Some("staged-memory-probe") => {
+            let path = parse_checkpoint_path(args.collect(), "staged-memory-probe")?;
+            run_staged_memory_probe(&path)
+        }
+
         Some("fence-probe") => {
             let path = parse_checkpoint_path(args.collect(), "fence-probe")?;
             run_fence_probe(&path)
@@ -2358,6 +2363,466 @@ fn run_fence_probe(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn run_staged_memory_probe(path: &str) -> Result<(), String> {
+    let checkpoint =
+        read_checkpoint_file(path).map_err(|error| format!("failed to read '{path}': {error}"))?;
+
+    let plan = plan_address_space(&checkpoint)
+        .map_err(|error| format!("failed to plan checkpoint address space: {error}"))?;
+
+    let reservations = plan
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            AddressSpaceOperation::Reserve {
+                allocation_base,
+                size,
+                ..
+            } => Some((*allocation_base, *size)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    let commits = plan
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            AddressSpaceOperation::Commit { region } => Some(region),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if reservations.is_empty() {
+        return Err("restore plan contains no supported PRIVATE reservations".to_string());
+    }
+
+    if commits.is_empty() {
+        return Err("restore plan contains no supported PRIVATE commits".to_string());
+    }
+
+    // Fail closed if a planned commit is not contained by one of the
+    // reservations that WCRE is about to own.
+    for region in &commits {
+        let end = region
+            .base_address
+            .checked_add(region.region_size)
+            .ok_or_else(|| format!("commit range overflows at 0x{:016X}", region.base_address))?;
+
+        let contained = reservations.iter().any(|(base, size)| {
+            base.checked_add(*size)
+                .map(|reservation_end| {
+                    region.allocation_base == *base
+                        && region.base_address >= *base
+                        && end <= reservation_end
+                })
+                .unwrap_or(false)
+        });
+
+        if !contained {
+            return Err(format!(
+                "planned commit 0x{:016X}-0x{end:016X} is not \
+                 contained by its planned reservation",
+                region.base_address
+            ));
+        }
+    }
+
+    let executable = checkpoint.process.image_path.clone();
+
+    println!("WCRE Staged Memory Restoration Probe");
+    println!();
+    println!("{:<36}{}", "Checkpoint:", path);
+    println!("{:<36}{}", "Captured PID:", checkpoint.process.captured_pid);
+    println!("{:<36}{}", "Captured executable:", executable);
+    println!("{:<36}{}", "Captured images:", checkpoint.images.len());
+    println!("{:<36}{}", "Planned reservations:", reservations.len());
+    println!("{:<36}{}", "Planned commits:", commits.len());
+    println!(
+        "{:<36}{}",
+        "Reservation bytes:",
+        format_size(plan.reservation_bytes)
+    );
+    println!("{:<36}{}", "Commit bytes:", format_size(plan.commit_bytes));
+    println!();
+
+    println!("Creating destination at CREATE_PROCESS_DEBUG_EVENT...");
+    println!();
+
+    let mut debug_session = LoaderDebugSession::create_at_process_event(&executable)
+        .map_err(|error| format!("failed to reach CREATE_PROCESS_DEBUG_EVENT: {error}"))?;
+
+    let pid = debug_session.process_id();
+
+    if debug_session.debug_events_seen() != 1
+        || debug_session.load_dll_events() != 0
+        || debug_session.initial_breakpoint().address != 0
+    {
+        return Err("destination was not stopped at the expected earliest \
+             debugger state"
+            .to_string());
+    }
+
+    println!("Early address-space fencing");
+    println!("---------------------------");
+
+    let mut address_session = ExactAddressSpaceSession::open(pid)
+        .map_err(|error| format!("failed to open exact-address session: {error}"))?;
+
+    for &(base, size) in &reservations {
+        print!("FENCE   0x{base:016X} size=0x{size:X} ... ");
+
+        address_session.reserve_exact(base, size).map_err(|error| {
+            format!(
+                "checkpoint fence 0x{base:016X} + \
+                     0x{size:X} failed: {error}"
+            )
+        })?;
+
+        let observed = address_session.query(base).map_err(|error| {
+            format!(
+                "failed to verify fence \
+                         0x{base:016X}: {error}"
+            )
+        })?;
+
+        if observed.base_address as u64 != base
+            || observed.allocation_base as u64 != base
+            || observed.state != Win32MemoryState::Reserve
+            || observed.region_size < usize::try_from(size).unwrap_or(usize::MAX)
+        {
+            return Err(format!(
+                "fence verification mismatch at \
+                 0x{base:016X}: {observed:?}"
+            ));
+        }
+
+        println!("EXACT");
+    }
+
+    println!("{:<36}{}", "Exact fences:", reservations.len());
+
+    println!();
+    println!("Advancing Windows loader...");
+    println!();
+
+    debug_session
+        .advance_to_initial_breakpoint()
+        .map_err(|error| format!("loader failed while fences were active: {error}"))?;
+
+    // The complete reservation must still exist before continuing.
+    for &(base, size) in &reservations {
+        let observed = address_session.query(base).map_err(|error| {
+            format!(
+                "initial-breakpoint fence query failed \
+                         at 0x{base:016X}: {error}"
+            )
+        })?;
+
+        if observed.base_address as u64 != base
+            || observed.allocation_base as u64 != base
+            || observed.state != Win32MemoryState::Reserve
+            || observed.region_size < usize::try_from(size).unwrap_or(usize::MAX)
+        {
+            return Err(format!(
+                "fence changed before initial breakpoint \
+                 at 0x{base:016X}: {observed:?}"
+            ));
+        }
+    }
+
+    println!(
+        "{:<36}{}",
+        "Initial-breakpoint fences:",
+        format!("{}/{} EXACT", reservations.len(), reservations.len())
+    );
+
+    println!();
+    println!("Staging executable entry point...");
+    println!();
+
+    let entry = debug_session.stage_to_entry_point().map_err(|error| {
+        format!(
+            "entry-point staging failed while fences \
+                     were active: {error}"
+        )
+    })?;
+
+    println!("{:<36}0x{:016X}", "Entry-point address:", entry.address);
+    println!("{:<36}{}", "Entry instruction executed:", "NO");
+
+    // Still entirely reserved before we begin changing the fences
+    // into reconstructed PRIVATE memory.
+    for &(base, size) in &reservations {
+        let observed = address_session.query(base).map_err(|error| {
+            format!(
+                "entry-stage fence query failed \
+                         at 0x{base:016X}: {error}"
+            )
+        })?;
+
+        if observed.base_address as u64 != base
+            || observed.allocation_base as u64 != base
+            || observed.state != Win32MemoryState::Reserve
+            || observed.region_size < usize::try_from(size).unwrap_or(usize::MAX)
+        {
+            return Err(format!(
+                "fence changed before memory restoration \
+                 at 0x{base:016X}: {observed:?}"
+            ));
+        }
+    }
+
+    println!(
+        "{:<36}{}",
+        "Entry-point fences:",
+        format!("{}/{} EXACT", reservations.len(), reservations.len())
+    );
+
+    println!();
+    println!("Entry-stage image compatibility");
+    println!("-------------------------------");
+
+    let images = capture_image_inventory(pid)
+        .map_err(|error| format!("failed to capture staged image inventory: {error}"))?;
+
+    let exact_base_matches = checkpoint
+        .images
+        .iter()
+        .filter(|captured| {
+            images
+                .images
+                .iter()
+                .any(|image| image.loaded_base as u64 == captured.loaded_base)
+        })
+        .count();
+
+    println!("{:<36}{}", "Captured image count:", checkpoint.images.len());
+    println!("{:<36}{}", "Exact image-base matches:", exact_base_matches);
+
+    if exact_base_matches != checkpoint.images.len() {
+        return Err(format!(
+            "only {exact_base_matches}/{} captured image bases \
+             are present before staged memory restoration",
+            checkpoint.images.len()
+        ));
+    }
+
+    println!("{:<36}{}", "All captured image bases:", "EXACT");
+
+    println!();
+    println!("Installing checkpoint PRIVATE memory");
+    println!("------------------------------------");
+
+    let memory_session = RemoteMemorySession::open(pid)
+        .map_err(|error| format!("failed to open staged remote-memory session: {error}"))?;
+
+    let mut committed_ranges = 0usize;
+    let mut payload_ranges = 0usize;
+    let mut payload_bytes = 0usize;
+    let mut payloadless_ranges = 0usize;
+    let mut protected_ranges = 0usize;
+
+    for region in commits {
+        let requested_end = region
+            .base_address
+            .checked_add(region.region_size)
+            .ok_or_else(|| format!("commit range overflow at 0x{:016X}", region.base_address))?;
+
+        print!(
+            "COMMIT  0x{:016X}-0x{requested_end:016X} ... ",
+            region.base_address
+        );
+
+        address_session
+            .commit_exact(region.base_address, region.region_size)
+            .map_err(|error| {
+                format!(
+                    "staged exact commit 0x{:016X} + \
+                     0x{:X} failed: {error}",
+                    region.base_address, region.region_size
+                )
+            })?;
+
+        let observed = address_session
+            .query(region.base_address)
+            .map_err(|error| {
+                format!(
+                    "failed to verify staged commit \
+                         0x{:016X}: {error}",
+                    region.base_address
+                )
+            })?;
+
+        let observed_end = observed.end_address() as u64;
+
+        if observed.state != Win32MemoryState::Commit
+            || observed.allocation_base as u64 != region.allocation_base
+            || observed.base_address as u64 > region.base_address
+            || observed_end < requested_end
+        {
+            return Err(format!(
+                "staged commit verification mismatch at \
+                 0x{:016X}: {observed:?}",
+                region.base_address
+            ));
+        }
+
+        println!("EXACT");
+
+        committed_ranges += 1;
+
+        if region.payload_id.is_some() {
+            let bytes = memory_session
+                .install_region_payload_verified(&checkpoint, region)
+                .map_err(|error| {
+                    format!(
+                        "payload installation failed for \
+                             0x{:016X} + 0x{:X}: {error}",
+                        region.base_address, region.region_size
+                    )
+                })?;
+
+            println!("    PAYLOAD bytes={bytes} ... VERIFIED");
+
+            payload_ranges += 1;
+
+            payload_bytes = payload_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| "verified payload byte count overflowed usize".to_string())?;
+        } else {
+            println!("    PAYLOAD ... NOT CAPTURED");
+
+            payloadless_ranges += 1;
+        }
+
+        let previous_protection = address_session
+            .restore_protection_exact(
+                region.base_address,
+                region.region_size,
+                region.protection.raw,
+            )
+            .map_err(|error| {
+                format!(
+                    "protection restoration failed for \
+                         0x{:016X} + 0x{:X}: {error}",
+                    region.base_address, region.region_size
+                )
+            })?;
+
+        let protected = address_session
+            .query(region.base_address)
+            .map_err(|error| {
+                format!(
+                    "failed to verify protection at \
+                         0x{:016X}: {error}",
+                    region.base_address
+                )
+            })?;
+
+        if protected.state != Win32MemoryState::Commit
+            || protected.allocation_base as u64 != region.allocation_base
+            || protected.protection.0 != region.protection.raw
+        {
+            return Err(format!(
+                "staged protection verification mismatch at \
+                 0x{:016X}: expected 0x{:08X}, \
+                 observed {protected:?}",
+                region.base_address, region.protection.raw
+            ));
+        }
+
+        println!(
+            "    PROTECT 0x{previous_protection:08X} -> \
+             0x{:08X} ... VERIFIED",
+            region.protection.raw
+        );
+
+        protected_ranges += 1;
+    }
+
+    println!();
+    println!("Staged reconstruction results");
+    println!("-----------------------------");
+
+    println!("{:<36}{}", "Exact reservations:", reservations.len());
+    println!("{:<36}{}", "Exact committed ranges:", committed_ranges);
+    println!("{:<36}{}", "Verified payload ranges:", payload_ranges);
+    println!("{:<36}{}", "Verified payload bytes:", payload_bytes);
+    println!(
+        "{:<36}{}",
+        "Payloadless committed ranges:", payloadless_ranges
+    );
+    println!("{:<36}{}", "Verified protection ranges:", protected_ranges);
+    println!(
+        "{:<36}{}",
+        "Captured image bases:",
+        format!("{exact_base_matches}/{} EXACT", checkpoint.images.len())
+    );
+
+    if committed_ranges
+        != plan
+            .operations
+            .iter()
+            .filter(|operation| matches!(operation, AddressSpaceOperation::Commit { .. }))
+            .count()
+    {
+        return Err("not every planned commit was reconstructed".to_string());
+    }
+
+    if protected_ranges != committed_ranges {
+        return Err("not every staged commit received its captured protection".to_string());
+    }
+
+    println!();
+    println!("Controlled cleanup");
+    println!("------------------");
+
+    address_session
+        .release_all()
+        .map_err(|error| format!("failed to release reconstructed PRIVATE memory: {error}"))?;
+
+    for &(base, _) in &reservations {
+        let address = usize::try_from(base).map_err(|_| {
+            format!(
+                "cleanup address 0x{base:016X} \
+                         does not fit usize"
+            )
+        })?;
+
+        let observed = query_memory_region(pid, address).map_err(|error| {
+            format!(
+                "cleanup verification failed to query \
+                         0x{base:016X}: {error}"
+            )
+        })?;
+
+        if observed.state != Win32MemoryState::Free {
+            return Err(format!(
+                "reconstructed allocation 0x{base:016X} \
+                 was not released: {observed:?}"
+            ));
+        }
+    }
+
+    debug_session
+        .terminate()
+        .map_err(|error| format!("failed to terminate staged destination: {error}"))?;
+
+    println!("{:<36}{}", "PRIVATE allocations released:", "YES");
+    println!("{:<36}{}", "Destination terminated:", "YES");
+    println!("{:<36}{}", "Captured TEB installed:", "NO");
+    println!("{:<36}{}", "Captured context installed:", "NO");
+    println!("{:<36}{}", "Captured execution resumed:", "NO");
+
+    println!();
+    println!(
+        "Checkpoint PRIVATE memory was reconstructed inside the \
+         loader-staged destination process."
+    );
+
+    Ok(())
+}
+
 fn run_entry_probe(path: &str, addresses: &[u64]) -> Result<(), String> {
     let checkpoint =
         read_checkpoint_file(path).map_err(|error| format!("failed to read '{path}': {error}"))?;
@@ -2968,6 +3433,7 @@ fn print_help() {
     println!("  wcre-cli snapshot-verify --pid <PID>");
     println!("  wcre-cli snapshot-private-diff --pid <PID>");
     println!("  wcre-cli create-event-probe <FILE.wcr> [--address <HEX> ...]");
+    println!("  wcre-cli staged-memory-probe <FILE.wcr>");
     println!("  wcre-cli fence-probe <FILE.wcr>");
     println!("  wcre-cli suspended-probe <FILE.wcr> [--address <HEX> ...]");
     println!("  wcre-cli loader-probe <FILE.wcr> [--address <HEX> ...]");
