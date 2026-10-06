@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use wcre_image::{
-    AddressSpaceOperation, SkipReason, plan_address_space, read_checkpoint_file,
+    AddressSpaceOperation, CheckpointModel, SkipReason, plan_address_space, read_checkpoint_file,
     write_checkpoint_v1_file, write_checkpoint_v2_file,
 };
 
@@ -13,8 +15,8 @@ use wcre_win32::{
     RemoteMemorySession, SuspendedProcessSession, capture_checkpoint_model,
     capture_image_inventory, capture_snapshot_probe, capture_thread_contexts,
     capture_thread_state_validation, capture_va_clone, compare_va_clone_memory,
-    diff_va_clone_private_memory, inspect_process, query_memory_map, query_memory_region,
-    read_process_memory,
+    diff_va_clone_private_memory, inspect_process, prepare_relocated_pe_image, query_memory_map,
+    query_memory_region, read_process_memory,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2033,6 +2035,142 @@ fn run_create_event_probe(path: &str, addresses: &[u64]) -> Result<(), String> {
     Ok(())
 }
 
+struct RestoreImageBootstrap {
+    directory: PathBuf,
+    executable: PathBuf,
+
+    original_image_base: u64,
+    relocated_image_base: u64,
+
+    dir64_relocations_applied: usize,
+    absolute_entries_skipped: usize,
+}
+
+impl RestoreImageBootstrap {
+    fn remove_with_retry(&self) -> Result<(), String> {
+        let mut last_error = None;
+
+        for _ in 0..100 {
+            match fs::remove_dir_all(&self.directory) {
+                Ok(()) => return Ok(()),
+
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(());
+                }
+
+                Err(error) => {
+                    last_error = Some(error);
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        Err(format!(
+            "failed to remove restore-bootstrap directory '{}': {}",
+            self.directory.display(),
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "unknown cleanup failure".to_string())
+        ))
+    }
+}
+
+impl Drop for RestoreImageBootstrap {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn image_basename(path: &str) -> String {
+    path.trim_end_matches('\0')
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase()
+}
+
+fn prepare_checkpoint_restore_bootstrap(
+    checkpoint: &CheckpointModel,
+) -> Result<RestoreImageBootstrap, String> {
+    let source = Path::new(&checkpoint.process.image_path);
+
+    let source_name = source.file_name().ok_or_else(|| {
+        format!(
+            "captured executable path has no file name: {}",
+            checkpoint.process.image_path
+        )
+    })?;
+
+    let wanted_name = source_name.to_string_lossy().to_ascii_lowercase();
+
+    let captured_main_image = checkpoint
+        .images
+        .iter()
+        .find(|image| {
+            image
+                .mapped_path
+                .as_deref()
+                .map(image_basename)
+                .map(|name| name == wanted_name)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| {
+            format!(
+                "checkpoint image inventory does not contain main executable '{}'",
+                wanted_name
+            )
+        })?;
+
+    let directory = env::temp_dir().join(format!(
+        "wcre-restore-bootstrap-{}-{}",
+        std::process::id(),
+        checkpoint.process.captured_pid
+    ));
+
+    if directory.exists() {
+        fs::remove_dir_all(&directory).map_err(|error| {
+            format!(
+                "failed to remove stale restore-bootstrap directory '{}': {error}",
+                directory.display()
+            )
+        })?;
+    }
+
+    fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "failed to create restore-bootstrap directory '{}': {error}",
+            directory.display()
+        )
+    })?;
+
+    let executable = directory.join(source_name);
+
+    let report =
+        match prepare_relocated_pe_image(source, captured_main_image.loaded_base, &executable) {
+            Ok(report) => report,
+
+            Err(error) => {
+                let _ = fs::remove_dir_all(&directory);
+
+                return Err(format!(
+                    "failed to prepare checkpoint IMAGE bootstrap: {error}"
+                ));
+            }
+        };
+
+    Ok(RestoreImageBootstrap {
+        directory,
+        executable,
+
+        original_image_base: report.original_image_base,
+        relocated_image_base: report.relocated_image_base,
+
+        dir64_relocations_applied: report.dir64_relocations_applied,
+        absolute_entries_skipped: report.absolute_entries_skipped,
+    })
+}
+
 fn run_fence_probe(path: &str) -> Result<(), String> {
     let checkpoint =
         read_checkpoint_file(path).map_err(|error| format!("failed to read '{path}': {error}"))?;
@@ -2429,11 +2567,34 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
 
     let executable = checkpoint.process.image_path.clone();
 
+    let bootstrap = prepare_checkpoint_restore_bootstrap(&checkpoint)?;
+
     println!("WCRE Staged Memory Restoration Probe");
     println!();
     println!("{:<36}{}", "Checkpoint:", path);
     println!("{:<36}{}", "Captured PID:", checkpoint.process.captured_pid);
     println!("{:<36}{}", "Captured executable:", executable);
+    println!(
+        "{:<36}{}",
+        "Restore bootstrap:",
+        bootstrap.executable.display()
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "Source PE ImageBase:", bootstrap.original_image_base
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "Captured EXE base:", bootstrap.relocated_image_base
+    );
+    println!(
+        "{:<36}{}",
+        "DIR64 relocations applied:", bootstrap.dir64_relocations_applied
+    );
+    println!(
+        "{:<36}{}",
+        "ABSOLUTE relocations skipped:", bootstrap.absolute_entries_skipped
+    );
     println!("{:<36}{}", "Captured images:", checkpoint.images.len());
     println!("{:<36}{}", "Planned reservations:", reservations.len());
     println!("{:<36}{}", "Planned commits:", commits.len());
@@ -2448,8 +2609,13 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
     println!("Creating destination at CREATE_PROCESS_DEBUG_EVENT...");
     println!();
 
-    let mut debug_session = LoaderDebugSession::create_at_process_event(&executable)
-        .map_err(|error| format!("failed to reach CREATE_PROCESS_DEBUG_EVENT: {error}"))?;
+    let mut debug_session =
+        LoaderDebugSession::create_at_process_event(&bootstrap.executable)
+            .map_err(|error| {
+                format!(
+                    "failed to launch relocated checkpoint IMAGE at                      CREATE_PROCESS_DEBUG_EVENT: {error}"
+                )
+            })?;
 
     let pid = debug_session.process_id();
 
@@ -2808,8 +2974,27 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
         .terminate()
         .map_err(|error| format!("failed to terminate staged destination: {error}"))?;
 
+    let bootstrap_executable = bootstrap.executable.clone();
+    let bootstrap_directory = bootstrap.directory.clone();
+
+    drop(memory_session);
+    drop(address_session);
+    drop(debug_session);
+
+    // The terminated debuggee may hold its mapped executable briefly while
+    // Windows finishes process teardown. All process handles are closed above
+    // before retrying deletion of the temporary restore image.
+    bootstrap.remove_with_retry()?;
+
+    if bootstrap_executable.exists() || bootstrap_directory.exists() {
+        return Err("temporary restore IMAGE bootstrap still exists after cleanup".to_string());
+    }
+
+    drop(bootstrap);
+
     println!("{:<36}{}", "PRIVATE allocations released:", "YES");
     println!("{:<36}{}", "Destination terminated:", "YES");
+    println!("{:<36}{}", "Restore bootstrap removed:", "YES");
     println!("{:<36}{}", "Captured TEB installed:", "NO");
     println!("{:<36}{}", "Captured context installed:", "NO");
     println!("{:<36}{}", "Captured execution resumed:", "NO");

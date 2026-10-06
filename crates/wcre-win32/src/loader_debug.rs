@@ -654,15 +654,17 @@ impl LoaderDebugSession {
     }
 
     /// Kill the loader-staged process without allowing application execution.
+    ///
+    /// A debugged process is not fully released merely because
+    /// TerminateProcess succeeds. WCRE must also drain and continue the final
+    /// EXIT_PROCESS_DEBUG_EVENT so Windows can release debugger-owned handles.
     pub fn terminate(&mut self) -> Result<(), LoaderDebugError> {
         if !self.active {
             return Ok(());
         }
 
-        // Terminate first, while the initial breakpoint still holds the target.
-        //
-        // SAFETY:
-        // This is the live process handle owned by the session.
+        // TerminateProcess is asynchronous. Request termination before
+        // releasing the currently pending breakpoint/debug event.
         unsafe { TerminateProcess(self.process_handle.raw(), 0) }.map_err(|error| {
             LoaderDebugError::Windows {
                 operation: "TerminateProcess",
@@ -670,11 +672,7 @@ impl LoaderDebugSession {
             }
         })?;
 
-        // Release the pending debugger event only after termination has been
-        // requested, so the target cannot proceed into normal application code.
         if let Some((process_id, thread_id)) = self.pending_debug_event.take() {
-            // SAFETY:
-            // This pair identifies the debug event currently pending.
             unsafe { ContinueDebugEvent(process_id, thread_id, DBG_CONTINUE) }.map_err(
                 |error| LoaderDebugError::Windows {
                     operation: "ContinueDebugEvent during termination",
@@ -683,8 +681,47 @@ impl LoaderDebugSession {
             )?;
         }
 
-        self.active = false;
-        Ok(())
+        // Drain debugger notifications until Windows reports that the process
+        // has actually exited. Continuing EXIT_PROCESS_DEBUG_EVENT releases
+        // the debugger-owned process/thread handles.
+        loop {
+            let mut event = DEBUG_EVENT::default();
+
+            unsafe { WaitForDebugEvent(&mut event, 5_000) }.map_err(|error| {
+                LoaderDebugError::Windows {
+                    operation: "WaitForDebugEvent during termination",
+                    error,
+                }
+            })?;
+
+            self.debug_events_seen += 1;
+
+            if event.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT {
+                let info = unsafe { event.u.LoadDll };
+
+                if info.hFile != HANDLE::default() {
+                    let _ = unsafe { CloseHandle(info.hFile) };
+                }
+            }
+
+            if event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT {
+                let info = unsafe { event.u.CreateProcessInfo };
+
+                if info.hFile != HANDLE::default() {
+                    let _ = unsafe { CloseHandle(info.hFile) };
+                }
+            }
+
+            let process_exited = event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT
+                && event.dwProcessId == self.process_id;
+
+            continue_event(&event)?;
+
+            if process_exited {
+                self.active = false;
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -694,8 +731,12 @@ impl Drop for LoaderDebugSession {
             return;
         }
 
-        // Best-effort fail-closed cleanup. The process is marked for termination
-        // before its pending breakpoint is released.
+        // Best effort: use the same complete debugger shutdown protocol.
+        if self.terminate().is_ok() {
+            return;
+        }
+
+        // Last-resort fail-closed fallback.
         let _ = unsafe { TerminateProcess(self.process_handle.raw(), 0) };
 
         if let Some((process_id, thread_id)) = self.pending_debug_event.take() {
