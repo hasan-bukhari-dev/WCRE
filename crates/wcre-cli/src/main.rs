@@ -12,8 +12,8 @@ use wcre_image::{
 
 use wcre_win32::{
     ExactAddressSpaceSession, ExactAllocationError, LoaderDebugSession,
-    MemoryState as Win32MemoryState, MemoryTypeReadSummary, ProcessArchitecture,
-    RemoteMemorySession, SuspendedProcessSession, capture_checkpoint_model,
+    MemoryState as Win32MemoryState, MemoryType as Win32MemoryType, MemoryTypeReadSummary,
+    ProcessArchitecture, RemoteMemorySession, SuspendedProcessSession, capture_checkpoint_model,
     capture_image_inventory, capture_snapshot_probe, capture_thread_contexts,
     capture_thread_state_validation, capture_va_clone, compare_va_clone_memory,
     diff_va_clone_private_memory, inspect_process, prepare_relocated_pe_image, query_memory_map,
@@ -2644,7 +2644,7 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
     println!("{:<36}{}", "RIP owner:", "CAPTURED MAIN IMAGE");
     println!("{:<36}{}", "Selection:", "UNIQUE");
     println!("{:<36}{}", "Stack bounds:", "VALID");
-    println!("{:<36}{}", "Destination thread mapped:", "NO");
+    println!("{:<36}{}", "Destination thread mapping:", "PENDING");
     println!();
     println!("{:<36}{}", "Planned reservations:", reservations.len());
     println!("{:<36}{}", "Planned commits:", commits.len());
@@ -2668,6 +2668,11 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
             })?;
 
     let pid = debug_session.process_id();
+    let destination_primary_tid = debug_session.primary_thread_id();
+
+    if destination_primary_tid == 0 {
+        return Err("destination primary thread ID is zero".to_string());
+    }
 
     if debug_session.debug_events_seen() != 1
         || debug_session.load_dll_events() != 0
@@ -2763,8 +2768,47 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
         )
     })?;
 
+    if entry.thread_id != destination_primary_tid {
+        return Err(format!(
+            "executable entry breakpoint was reached by destination TID {}, \
+             but the intended destination primary TID is {}",
+            entry.thread_id, destination_primary_tid
+        ));
+    }
+
     println!("{:<36}0x{:016X}", "Entry-point address:", entry.address);
     println!("{:<36}{}", "Entry instruction executed:", "NO");
+
+    println!();
+    println!("Captured-to-destination thread mapping");
+    println!("--------------------------------------");
+    println!(
+        "{:<36}{}",
+        "Captured application TID:", selected_thread.thread_id
+    );
+    println!("{:<36}{}", "Destination PID:", pid);
+    println!(
+        "{:<36}{}",
+        "Destination primary TID:", destination_primary_tid
+    );
+    println!("{:<36}{}", "Entry breakpoint TID:", entry.thread_id);
+    println!(
+        "{:<36}{}",
+        "Numeric TID values:",
+        if selected_thread.thread_id == destination_primary_tid {
+            "SAME VALUE; DISTINCT THREAD IDENTITIES"
+        } else {
+            "DIFFERENT"
+        }
+    );
+    println!(
+        "{:<36}{}",
+        "Logical mapping:", "CAPTURED APPLICATION -> DESTINATION PRIMARY"
+    );
+    println!("{:<36}{}", "Destination thread mapped:", "YES");
+    println!("{:<36}{}", "Destination remains stopped:", "YES");
+    println!("{:<36}{}", "Destination TEB modified:", "NO");
+    println!("{:<36}{}", "Captured context installed:", "NO");
 
     // Still entirely reserved before we begin changing the fences
     // into reconstructed PRIVATE memory.
@@ -2824,14 +2868,221 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
     }
 
     println!("{:<36}{}", "All captured image bases:", "EXACT");
-    println!();
-    println!("Read-only main IMAGE payload comparison");
-    println!("---------------------------------------");
 
     let image_memory_session = RemoteMemorySession::open(pid)
         .map_err(|error| format!("failed to open IMAGE diagnostic memory session: {error}"))?;
 
     let main_image_end = main_image.end_address();
+
+    const RIP_VERIFICATION_BYTES: usize = 16;
+
+    let mut captured_rip_regions = checkpoint.memory_regions.iter().filter(|region| {
+        if region.kind != MemoryKind::Image {
+            return false;
+        }
+
+        region
+            .base_address
+            .checked_add(region.region_size)
+            .is_some_and(|end| {
+                selected_context.rip >= region.base_address && selected_context.rip < end
+            })
+    });
+
+    let captured_rip_region = captured_rip_regions.next().ok_or_else(|| {
+        format!(
+            "captured RIP 0x{:016X} does not belong to a captured IMAGE memory region",
+            selected_context.rip
+        )
+    })?;
+
+    if captured_rip_regions.next().is_some() {
+        return Err(format!(
+            "captured RIP 0x{:016X} belongs to multiple captured IMAGE regions",
+            selected_context.rip
+        ));
+    }
+
+    let captured_rip_region_end = captured_rip_region
+        .base_address
+        .checked_add(captured_rip_region.region_size)
+        .ok_or_else(|| {
+            format!(
+                "captured RIP IMAGE region overflows at 0x{:016X}",
+                captured_rip_region.base_address
+            )
+        })?;
+
+    if captured_rip_region.base_address < main_image.loaded_base
+        || captured_rip_region_end > main_image_end
+    {
+        return Err(format!(
+            "captured RIP IMAGE region 0x{:016X}-0x{:016X} lies outside \
+             captured main executable 0x{:016X}-0x{:016X}",
+            captured_rip_region.base_address,
+            captured_rip_region_end,
+            main_image.loaded_base,
+            main_image_end
+        ));
+    }
+
+    let captured_rip_protection = captured_rip_region.protection.raw & 0xFF;
+
+    if !matches!(
+        captured_rip_protection,
+        0x00000010 | 0x00000020 | 0x00000040 | 0x00000080
+    ) {
+        return Err(format!(
+            "captured RIP 0x{:016X} lies in non-executable IMAGE protection 0x{:08X}",
+            selected_context.rip, captured_rip_region.protection.raw
+        ));
+    }
+
+    let rip_payload_id = captured_rip_region.payload_id.ok_or_else(|| {
+        format!(
+            "captured RIP IMAGE region at 0x{:016X} has no captured payload",
+            captured_rip_region.base_address
+        )
+    })?;
+
+    let rip_payload = checkpoint
+        .payloads
+        .iter()
+        .find(|payload| payload.id == rip_payload_id)
+        .ok_or_else(|| {
+            format!(
+                "captured RIP IMAGE region references missing payload {}",
+                rip_payload_id
+            )
+        })?;
+
+    if rip_payload.base_address != captured_rip_region.base_address
+        || rip_payload.bytes.len() as u64 != captured_rip_region.region_size
+    {
+        return Err(format!(
+            "captured RIP payload {} does not exactly describe IMAGE region \
+             0x{:016X}-0x{:016X}",
+            rip_payload_id, captured_rip_region.base_address, captured_rip_region_end
+        ));
+    }
+
+    let rip_offset = usize::try_from(
+        selected_context
+            .rip
+            .checked_sub(captured_rip_region.base_address)
+            .ok_or_else(|| "captured RIP offset underflow".to_string())?,
+    )
+    .map_err(|_| "captured RIP offset does not fit usize".to_string())?;
+
+    let rip_end_offset = rip_offset
+        .checked_add(RIP_VERIFICATION_BYTES)
+        .ok_or_else(|| "captured RIP verification range overflow".to_string())?;
+
+    let captured_rip_bytes = rip_payload
+        .bytes
+        .get(rip_offset..rip_end_offset)
+        .ok_or_else(|| {
+            format!(
+                "checkpoint does not contain {} contiguous bytes beginning at \
+                 captured RIP 0x{:016X}",
+                RIP_VERIFICATION_BYTES, selected_context.rip
+            )
+        })?;
+
+    let rip_address = usize::try_from(selected_context.rip)
+        .map_err(|_| "captured RIP does not fit destination address type".to_string())?;
+
+    let destination_rip_region = query_memory_region(pid, rip_address).map_err(|error| {
+        format!(
+            "failed to query destination memory at captured RIP \
+             0x{:016X}: {error}",
+            selected_context.rip
+        )
+    })?;
+
+    if destination_rip_region.kind != Win32MemoryType::Image {
+        return Err(format!(
+            "destination address 0x{:016X} is {}, expected IMAGE",
+            selected_context.rip, destination_rip_region.kind
+        ));
+    }
+
+    let destination_rip_protection = destination_rip_region.protection.0 & 0xFF;
+
+    if !matches!(
+        destination_rip_protection,
+        0x00000010 | 0x00000020 | 0x00000040 | 0x00000080
+    ) {
+        return Err(format!(
+            "destination captured-RIP address 0x{:016X} is not executable: {}",
+            selected_context.rip, destination_rip_region.protection
+        ));
+    }
+
+    let destination_rip_bytes = image_memory_session
+        .read_exact(selected_context.rip, RIP_VERIFICATION_BYTES)
+        .map_err(|error| {
+            format!(
+                "failed to read destination bytes at captured RIP \
+                 0x{:016X}: {error}",
+                selected_context.rip
+            )
+        })?;
+
+    if let Some((offset, (&expected, &observed))) = captured_rip_bytes
+        .iter()
+        .zip(destination_rip_bytes.iter())
+        .enumerate()
+        .find(|(_, (expected, observed))| expected != observed)
+    {
+        return Err(format!(
+            "captured RIP code mismatch at 0x{:016X}+0x{:X}: \
+             expected 0x{:02X}, observed 0x{:02X}",
+            selected_context.rip, offset, expected, observed
+        ));
+    }
+
+    let captured_rip_hex = captured_rip_bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let destination_rip_hex = destination_rip_bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    println!();
+    println!("Captured RIP code verification");
+    println!("------------------------------");
+    println!("{:<36}0x{:016X}", "Captured RIP:", selected_context.rip);
+    println!(
+        "{:<36}0x{:016X}-0x{:016X}",
+        "Captured IMAGE region:", captured_rip_region.base_address, captured_rip_region_end
+    );
+    println!(
+        "{:<36}0x{:08X}",
+        "Captured protection:", captured_rip_region.protection.raw
+    );
+    println!(
+        "{:<36}{}",
+        "Destination memory type:", destination_rip_region.kind
+    );
+    println!(
+        "{:<36}{}",
+        "Destination protection:", destination_rip_region.protection
+    );
+    println!("{:<36}{}", "Bytes compared:", RIP_VERIFICATION_BYTES);
+    println!("{:<36}{}", "Captured bytes:", captured_rip_hex);
+    println!("{:<36}{}", "Destination bytes:", destination_rip_hex);
+    println!("{:<36}{}", "Captured RIP code bytes:", "EXACT");
+    println!("{:<36}{}", "Destination remains stopped:", "YES");
+
+    println!();
+    println!("Read-only main IMAGE payload comparison");
+    println!("---------------------------------------");
 
     let mut image_payload_regions = 0usize;
     let mut identical_image_regions = 0usize;
@@ -3289,6 +3540,305 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
     if protected_ranges != committed_ranges {
         return Err("not every staged commit received its captured protection".to_string());
     }
+
+    // M4.2 requires more than knowing that the captured RSP numerically falls
+    // inside the selected thread's recorded StackLimit/StackBase range.
+    //
+    // Before any future TEB or CONTEXT manipulation, prove that:
+    //   1. exactly one captured thread owns the RSP through its stack bounds,
+    //   2. that owner is the selected application thread,
+    //   3. the captured memory backing RSP is committed PRIVATE stack memory,
+    //   4. the destination reconstructed the same allocation/protection, and
+    //   5. bytes beginning at RSP match the persisted checkpoint exactly.
+
+    let stack_owner_ids = checkpoint
+        .threads
+        .iter()
+        .filter(|thread| match (thread.stack_limit, thread.stack_base) {
+            (Some(stack_limit), Some(stack_base)) => {
+                selected_context.rsp >= stack_limit && selected_context.rsp < stack_base
+            }
+            _ => false,
+        })
+        .map(|thread| thread.thread_id)
+        .collect::<Vec<_>>();
+
+    if stack_owner_ids.len() != 1 {
+        return Err(format!(
+            "captured RSP 0x{:016X} belongs to {} captured thread stack ranges; expected exactly one",
+            selected_context.rsp,
+            stack_owner_ids.len()
+        ));
+    }
+
+    if stack_owner_ids[0] != selected_thread.thread_id {
+        return Err(format!(
+            "captured RSP 0x{:016X} belongs to captured TID {}, \
+             but selected application TID is {}",
+            selected_context.rsp, stack_owner_ids[0], selected_thread.thread_id
+        ));
+    }
+
+    let mut captured_rsp_regions = checkpoint.memory_regions.iter().filter(|region| {
+        if region.kind != MemoryKind::Private {
+            return false;
+        }
+
+        region
+            .base_address
+            .checked_add(region.region_size)
+            .is_some_and(|end| {
+                selected_context.rsp >= region.base_address && selected_context.rsp < end
+            })
+    });
+
+    let captured_rsp_region = captured_rsp_regions.next().ok_or_else(|| {
+        format!(
+            "captured RSP 0x{:016X} does not belong to captured PRIVATE memory",
+            selected_context.rsp
+        )
+    })?;
+
+    if captured_rsp_regions.next().is_some() {
+        return Err(format!(
+            "captured RSP 0x{:016X} belongs to multiple captured PRIVATE regions",
+            selected_context.rsp
+        ));
+    }
+
+    if captured_rsp_region.state != wcre_image::MemoryState::Commit {
+        return Err(format!(
+            "captured RSP 0x{:016X} belongs to non-committed PRIVATE memory",
+            selected_context.rsp
+        ));
+    }
+
+    let captured_rsp_region_end = captured_rsp_region
+        .base_address
+        .checked_add(captured_rsp_region.region_size)
+        .ok_or_else(|| {
+            format!(
+                "captured RSP PRIVATE region overflows at 0x{:016X}",
+                captured_rsp_region.base_address
+            )
+        })?;
+
+    if captured_rsp_region.base_address < selected_stack_limit
+        || captured_rsp_region_end > selected_stack_base
+    {
+        return Err(format!(
+            "captured RSP PRIVATE region 0x{:016X}-0x{:016X} is not wholly \
+             owned by selected stack 0x{:016X}-0x{:016X}",
+            captured_rsp_region.base_address,
+            captured_rsp_region_end,
+            selected_stack_limit,
+            selected_stack_base
+        ));
+    }
+
+    let rsp_payload_id = captured_rsp_region.payload_id.ok_or_else(|| {
+        format!(
+            "captured RSP PRIVATE region at 0x{:016X} has no persisted payload",
+            captured_rsp_region.base_address
+        )
+    })?;
+
+    let rsp_payload = checkpoint
+        .payloads
+        .iter()
+        .find(|payload| payload.id == rsp_payload_id)
+        .ok_or_else(|| {
+            format!(
+                "captured RSP PRIVATE region references missing payload {}",
+                rsp_payload_id
+            )
+        })?;
+
+    if rsp_payload.base_address != captured_rsp_region.base_address
+        || rsp_payload.bytes.len() as u64 != captured_rsp_region.region_size
+    {
+        return Err(format!(
+            "captured RSP payload {} does not exactly describe PRIVATE region \
+             0x{:016X}-0x{:016X}",
+            rsp_payload_id, captured_rsp_region.base_address, captured_rsp_region_end
+        ));
+    }
+
+    const RSP_VERIFICATION_BYTES: usize = 32;
+
+    let rsp_verification_end = selected_context
+        .rsp
+        .checked_add(RSP_VERIFICATION_BYTES as u64)
+        .ok_or_else(|| "captured RSP verification range overflow".to_string())?;
+
+    if rsp_verification_end > selected_stack_base {
+        return Err(format!(
+            "{} verification bytes beginning at captured RSP 0x{:016X} \
+             would extend past StackBase 0x{:016X}",
+            RSP_VERIFICATION_BYTES, selected_context.rsp, selected_stack_base
+        ));
+    }
+
+    if rsp_verification_end > captured_rsp_region_end {
+        return Err(format!(
+            "{} verification bytes beginning at captured RSP 0x{:016X} \
+             cross the captured PRIVATE region boundary",
+            RSP_VERIFICATION_BYTES, selected_context.rsp
+        ));
+    }
+
+    let rsp_offset = usize::try_from(
+        selected_context
+            .rsp
+            .checked_sub(captured_rsp_region.base_address)
+            .ok_or_else(|| "captured RSP payload offset underflow".to_string())?,
+    )
+    .map_err(|_| "captured RSP payload offset does not fit usize".to_string())?;
+
+    let rsp_end_offset = rsp_offset
+        .checked_add(RSP_VERIFICATION_BYTES)
+        .ok_or_else(|| "captured RSP payload slice overflow".to_string())?;
+
+    let captured_rsp_bytes = rsp_payload
+        .bytes
+        .get(rsp_offset..rsp_end_offset)
+        .ok_or_else(|| {
+            format!(
+                "checkpoint does not contain {} contiguous bytes beginning at \
+                 captured RSP 0x{:016X}",
+                RSP_VERIFICATION_BYTES, selected_context.rsp
+            )
+        })?;
+
+    let rsp_address = usize::try_from(selected_context.rsp)
+        .map_err(|_| "captured RSP does not fit destination address type".to_string())?;
+
+    let destination_rsp_region = query_memory_region(pid, rsp_address).map_err(|error| {
+        format!(
+            "failed to query reconstructed destination stack at \
+             0x{:016X}: {error}",
+            selected_context.rsp
+        )
+    })?;
+
+    if destination_rsp_region.state != Win32MemoryState::Commit {
+        return Err(format!(
+            "destination captured-RSP address 0x{:016X} is {}, expected Commit",
+            selected_context.rsp, destination_rsp_region.state
+        ));
+    }
+
+    if destination_rsp_region.kind != Win32MemoryType::Private {
+        return Err(format!(
+            "destination captured-RSP address 0x{:016X} is {}, expected Private",
+            selected_context.rsp, destination_rsp_region.kind
+        ));
+    }
+
+    if destination_rsp_region.allocation_base as u64 != captured_rsp_region.allocation_base {
+        return Err(format!(
+            "destination captured-RSP allocation base mismatch: \
+             expected 0x{:016X}, observed 0x{:016X}",
+            captured_rsp_region.allocation_base, destination_rsp_region.allocation_base as u64
+        ));
+    }
+
+    if destination_rsp_region.protection.0 != captured_rsp_region.protection.raw {
+        return Err(format!(
+            "destination captured-RSP protection mismatch: \
+             expected 0x{:08X}, observed 0x{:08X}",
+            captured_rsp_region.protection.raw, destination_rsp_region.protection.0
+        ));
+    }
+
+    let destination_rsp_region_end = destination_rsp_region.end_address() as u64;
+
+    if destination_rsp_region.base_address as u64 > selected_context.rsp
+        || destination_rsp_region_end < rsp_verification_end
+    {
+        return Err(format!(
+            "destination memory region does not fully cover the {}-byte \
+             captured-RSP verification range",
+            RSP_VERIFICATION_BYTES
+        ));
+    }
+
+    let destination_rsp_bytes = memory_session
+        .read_exact(selected_context.rsp, RSP_VERIFICATION_BYTES)
+        .map_err(|error| {
+            format!(
+                "failed to read reconstructed destination stack bytes at \
+                 0x{:016X}: {error}",
+                selected_context.rsp
+            )
+        })?;
+
+    if let Some((offset, (&expected, &observed))) = captured_rsp_bytes
+        .iter()
+        .zip(destination_rsp_bytes.iter())
+        .enumerate()
+        .find(|(_, (expected, observed))| expected != observed)
+    {
+        return Err(format!(
+            "reconstructed stack mismatch at captured RSP \
+             0x{:016X}+0x{:X}: expected 0x{:02X}, observed 0x{:02X}",
+            selected_context.rsp, offset, expected, observed
+        ));
+    }
+
+    let captured_rsp_hex = captured_rsp_bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let destination_rsp_hex = destination_rsp_bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    println!();
+    println!("Captured RSP stack verification");
+    println!("-------------------------------");
+    println!("{:<36}0x{:016X}", "Captured RSP:", selected_context.rsp);
+    println!(
+        "{:<36}{}",
+        "Captured stack owner TID:", selected_thread.thread_id
+    );
+    println!(
+        "{:<36}0x{:016X}-0x{:016X}",
+        "Captured stack:", selected_stack_limit, selected_stack_base
+    );
+    println!(
+        "{:<36}0x{:016X}-0x{:016X}",
+        "Captured PRIVATE region:", captured_rsp_region.base_address, captured_rsp_region_end
+    );
+    println!(
+        "{:<36}{}",
+        "Destination memory state:", destination_rsp_region.state
+    );
+    println!(
+        "{:<36}{}",
+        "Destination memory type:", destination_rsp_region.kind
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "Destination allocation base:", destination_rsp_region.allocation_base as u64
+    );
+    println!(
+        "{:<36}{}",
+        "Destination protection:", destination_rsp_region.protection
+    );
+    println!(
+        "{:<36}{}",
+        "Bytes compared from RSP:", RSP_VERIFICATION_BYTES
+    );
+    println!("{:<36}{}", "Captured RSP bytes:", captured_rsp_hex);
+    println!("{:<36}{}", "Destination RSP bytes:", destination_rsp_hex);
+    println!("{:<36}{}", "Stack ownership:", "UNIQUE SELECTED THREAD");
+    println!("{:<36}{}", "Reconstructed RSP bytes:", "EXACT");
+    println!("{:<36}{}", "Destination remains stopped:", "YES");
 
     println!();
     println!("Controlled cleanup");
