@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use wcre_image::{
-    AddressSpaceOperation, CheckpointModel, SkipReason, plan_address_space, read_checkpoint_file,
-    write_checkpoint_v1_file, write_checkpoint_v2_file,
+    AddressSpaceOperation, CheckpointModel, MemoryKind, SkipReason, plan_address_space,
+    read_checkpoint_file, write_checkpoint_v1_file, write_checkpoint_v2_file,
 };
 
 use wcre_win32::{
@@ -2774,6 +2774,318 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
     }
 
     println!("{:<36}{}", "All captured image bases:", "EXACT");
+    println!();
+    println!("Read-only main IMAGE payload comparison");
+    println!("---------------------------------------");
+
+    let image_memory_session = RemoteMemorySession::open(pid)
+        .map_err(|error| format!("failed to open IMAGE diagnostic memory session: {error}"))?;
+
+    let main_image = checkpoint
+        .images
+        .iter()
+        .find(|image| image.loaded_base == bootstrap.relocated_image_base)
+        .ok_or_else(|| {
+            format!(
+                "checkpoint does not contain main IMAGE at 0x{:016X}",
+                bootstrap.relocated_image_base
+            )
+        })?;
+
+    let main_image_end = main_image.end_address();
+
+    let mut image_payload_regions = 0usize;
+    let mut identical_image_regions = 0usize;
+    let mut differing_image_regions = 0usize;
+    let mut compared_image_bytes = 0usize;
+    let mut differing_image_bytes = 0usize;
+
+    for region in checkpoint.memory_regions.iter().filter(|region| {
+        region.kind == MemoryKind::Image
+            && region.base_address >= main_image.loaded_base
+            && region.base_address < main_image_end
+            && region.payload_id.is_some()
+    }) {
+        let region_end = region
+            .base_address
+            .checked_add(region.region_size)
+            .ok_or_else(|| {
+                format!(
+                    "main IMAGE region overflows at 0x{:016X}",
+                    region.base_address
+                )
+            })?;
+
+        if region_end > main_image_end {
+            return Err(format!(
+                "main IMAGE region 0x{:016X}-0x{region_end:016X} extends past \
+                 executable end 0x{main_image_end:016X}",
+                region.base_address
+            ));
+        }
+
+        let payload_id = region
+            .payload_id
+            .expect("IMAGE diagnostic filtered for payload-bearing regions");
+
+        let payload = checkpoint
+            .payloads
+            .iter()
+            .find(|payload| payload.id == payload_id)
+            .ok_or_else(|| {
+                format!(
+                    "IMAGE region 0x{:016X} references missing payload {}",
+                    region.base_address, payload_id
+                )
+            })?;
+
+        if payload.base_address != region.base_address {
+            return Err(format!(
+                "IMAGE payload {} base mismatch: region=0x{:016X}, payload=0x{:016X}",
+                payload_id, region.base_address, payload.base_address
+            ));
+        }
+
+        if payload.bytes.len() as u64 != region.region_size {
+            return Err(format!(
+                "IMAGE payload {} size mismatch at 0x{:016X}: \
+                 region=0x{:X}, payload=0x{:X}",
+                payload_id,
+                region.base_address,
+                region.region_size,
+                payload.bytes.len()
+            ));
+        }
+
+        let observed = image_memory_session
+            .read_exact(region.base_address, payload.bytes.len())
+            .map_err(|error| {
+                format!(
+                    "failed to read staged IMAGE at 0x{:016X}: {error}",
+                    region.base_address
+                )
+            })?;
+
+        let first_difference = payload
+            .bytes
+            .iter()
+            .zip(observed.iter())
+            .position(|(captured, staged)| captured != staged);
+
+        let region_differences = payload
+            .bytes
+            .iter()
+            .zip(observed.iter())
+            .filter(|(captured, staged)| captured != staged)
+            .count();
+
+        image_payload_regions += 1;
+
+        compared_image_bytes = compared_image_bytes
+            .checked_add(payload.bytes.len())
+            .ok_or_else(|| "IMAGE compared-byte counter overflow".to_string())?;
+
+        if let Some(first_difference) = first_difference {
+            differing_image_regions += 1;
+
+            differing_image_bytes = differing_image_bytes
+                .checked_add(region_differences)
+                .ok_or_else(|| "IMAGE differing-byte counter overflow".to_string())?;
+
+            println!(
+                "DIFF  0x{:016X}-0x{region_end:016X} \
+                 protection=0x{:08X} differing={} first=+0x{:X}",
+                region.base_address, region.protection.raw, region_differences, first_difference
+            );
+        } else {
+            identical_image_regions += 1;
+
+            println!(
+                "SAME  0x{:016X}-0x{region_end:016X} protection=0x{:08X}",
+                region.base_address, region.protection.raw
+            );
+        }
+    }
+
+    if image_payload_regions == 0 {
+        return Err(
+            "checkpoint contains no payload-bearing main executable IMAGE regions".to_string(),
+        );
+    }
+
+    println!();
+    println!("{:<36}{}", "Compared IMAGE regions:", image_payload_regions);
+    println!(
+        "{:<36}{}",
+        "Identical IMAGE regions:", identical_image_regions
+    );
+    println!(
+        "{:<36}{}",
+        "Differing IMAGE regions:", differing_image_regions
+    );
+    println!("{:<36}{}", "Compared IMAGE bytes:", compared_image_bytes);
+    println!("{:<36}{}", "Differing IMAGE bytes:", differing_image_bytes);
+
+    println!();
+    println!("Restoring controlled writable main IMAGE state");
+    println!("-----------------------------------------------");
+
+    let mut restored_image_regions = 0usize;
+    let mut restored_image_bytes = 0usize;
+    let mut changed_image_bytes_before_restore = 0usize;
+
+    for region in checkpoint.memory_regions.iter().filter(|region| {
+        region.kind == MemoryKind::Image
+            && region.base_address >= main_image.loaded_base
+            && region.base_address < main_image_end
+            && region.payload_id.is_some()
+            && region.protection.raw == 0x00000004
+    }) {
+        let region_end = region
+            .base_address
+            .checked_add(region.region_size)
+            .ok_or_else(|| {
+                format!(
+                    "writable IMAGE region overflows at 0x{:016X}",
+                    region.base_address
+                )
+            })?;
+
+        if region_end > main_image_end {
+            return Err(format!(
+                "writable IMAGE region 0x{:016X}-0x{region_end:016X} extends \
+                 beyond main executable",
+                region.base_address
+            ));
+        }
+
+        let payload_id = region
+            .payload_id
+            .expect("writable IMAGE restoration filtered for payloads");
+
+        let payload = checkpoint
+            .payloads
+            .iter()
+            .find(|payload| payload.id == payload_id)
+            .ok_or_else(|| {
+                format!(
+                    "writable IMAGE region 0x{:016X} references missing payload {}",
+                    region.base_address, payload_id
+                )
+            })?;
+
+        if payload.base_address != region.base_address {
+            return Err(format!(
+                "writable IMAGE payload {} base mismatch: \
+                 region=0x{:016X}, payload=0x{:016X}",
+                payload_id, region.base_address, payload.base_address
+            ));
+        }
+
+        if payload.bytes.len() as u64 != region.region_size {
+            return Err(format!(
+                "writable IMAGE payload {} size mismatch at 0x{:016X}: \
+                 region=0x{:X}, payload=0x{:X}",
+                payload_id,
+                region.base_address,
+                region.region_size,
+                payload.bytes.len()
+            ));
+        }
+
+        let before = image_memory_session
+            .read_exact(region.base_address, payload.bytes.len())
+            .map_err(|error| {
+                format!(
+                    "failed to read writable IMAGE before restoration \
+                     at 0x{:016X}: {error}",
+                    region.base_address
+                )
+            })?;
+
+        let before_differences = payload
+            .bytes
+            .iter()
+            .zip(before.iter())
+            .filter(|(captured, staged)| captured != staged)
+            .count();
+
+        image_memory_session
+            .write_exact(region.base_address, &payload.bytes)
+            .map_err(|error| {
+                format!(
+                    "failed to restore writable IMAGE at \
+                     0x{:016X}: {error}",
+                    region.base_address
+                )
+            })?;
+
+        let after = image_memory_session
+            .read_exact(region.base_address, payload.bytes.len())
+            .map_err(|error| {
+                format!(
+                    "failed to verify writable IMAGE at \
+                     0x{:016X}: {error}",
+                    region.base_address
+                )
+            })?;
+
+        if let Some((offset, (&expected, &observed))) = payload
+            .bytes
+            .iter()
+            .zip(after.iter())
+            .enumerate()
+            .find(|(_, (expected, observed))| expected != observed)
+        {
+            return Err(format!(
+                "writable IMAGE verification failed at 0x{:016X}+0x{:X}: \
+                 expected 0x{:02X}, observed 0x{:02X}",
+                region.base_address, offset, expected, observed
+            ));
+        }
+
+        println!(
+            "RESTORE 0x{:016X}-0x{region_end:016X} \
+             protection=0x{:08X} changed_before={} bytes={} ... VERIFIED",
+            region.base_address,
+            region.protection.raw,
+            before_differences,
+            payload.bytes.len()
+        );
+
+        restored_image_regions += 1;
+
+        restored_image_bytes = restored_image_bytes
+            .checked_add(payload.bytes.len())
+            .ok_or_else(|| "restored IMAGE byte counter overflow".to_string())?;
+
+        changed_image_bytes_before_restore = changed_image_bytes_before_restore
+            .checked_add(before_differences)
+            .ok_or_else(|| "changed IMAGE byte counter overflow".to_string())?;
+    }
+
+    if restored_image_regions == 0 {
+        return Err(
+            "no payload-bearing PAGE_READWRITE main-executable IMAGE regions found".to_string(),
+        );
+    }
+
+    println!();
+    println!(
+        "{:<36}{}",
+        "Writable IMAGE regions restored:", restored_image_regions
+    );
+    println!(
+        "{:<36}{}",
+        "Writable IMAGE bytes restored:", restored_image_bytes
+    );
+    println!(
+        "{:<36}{}",
+        "Differing bytes before restore:", changed_image_bytes_before_restore
+    );
+    println!("{:<36}{}", "Writable IMAGE readback:", "VERIFIED");
+
+    drop(image_memory_session);
 
     println!();
     println!("Installing checkpoint PRIVATE memory");
