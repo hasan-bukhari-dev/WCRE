@@ -181,6 +181,10 @@ impl DebugThreadHandle {
     unsafe fn from_owned(handle: HANDLE) -> Self {
         Self(handle)
     }
+
+    fn raw(&self) -> HANDLE {
+        self.0
+    }
 }
 
 impl Drop for DebugThreadHandle {
@@ -631,6 +635,42 @@ impl LoaderDebugSession {
 
     pub fn primary_thread_id(&self) -> u32 {
         self.primary_thread_id
+    }
+
+    /// Observe the Windows-created primary thread's current TEB/NT_TIB stack
+    /// metadata without modifying the TEB or CPU context.
+    pub fn primary_thread_teb_info(
+        &self,
+    ) -> Result<
+        crate::destination_thread::DestinationThreadTebInfo,
+        crate::destination_thread::DestinationThreadTebError,
+    > {
+        crate::destination_thread::query_destination_thread_teb(
+            self.process_handle.raw(),
+            self._primary_thread_handle.raw(),
+            self.process_id,
+            self.primary_thread_id,
+        )
+    }
+
+    /// Reconcile only the public NT_TIB StackBase and StackLimit fields of
+    /// the Windows-created primary thread. The thread remains stopped.
+    pub fn reconcile_primary_thread_stack_bounds(
+        &self,
+        stack_limit: u64,
+        stack_base: u64,
+    ) -> Result<
+        crate::destination_thread::DestinationThreadStackReconciliation,
+        crate::destination_thread::DestinationThreadTebError,
+    > {
+        crate::destination_thread::reconcile_destination_thread_stack_bounds(
+            self.process_handle.raw(),
+            self._primary_thread_handle.raw(),
+            self.process_id,
+            self.primary_thread_id,
+            stack_limit,
+            stack_base,
+        )
     }
 
     pub fn image_base(&self) -> usize {
