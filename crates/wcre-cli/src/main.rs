@@ -2810,6 +2810,101 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
     println!("{:<36}{}", "Destination TEB modified:", "NO");
     println!("{:<36}{}", "Captured context installed:", "NO");
 
+    // M4.3 begins read-only. Observe the Windows-created destination TEB
+    // before changing any thread-environment or CPU-context state.
+    let destination_teb = debug_session
+        .primary_thread_teb_info()
+        .map_err(|error| format!("failed to observe destination primary-thread TEB: {error}"))?;
+
+    if !destination_teb.self_pointer_valid() {
+        return Err(format!(
+            "destination TEB Self pointer mismatch: TEB=0x{:016X}, Self=0x{:016X}",
+            destination_teb.teb_base_address, destination_teb.self_pointer
+        ));
+    }
+
+    if !destination_teb.stack_bounds_valid() {
+        return Err(format!(
+            "destination TEB reports invalid stack bounds: \
+             StackLimit=0x{:016X}, StackBase=0x{:016X}",
+            destination_teb.stack_limit, destination_teb.stack_base
+        ));
+    }
+
+    let captured_stack_matches_destination = destination_teb.stack_limit == selected_stack_limit
+        && destination_teb.stack_base == selected_stack_base;
+
+    let captured_rsp_in_destination_stack = selected_context.rsp >= destination_teb.stack_limit
+        && selected_context.rsp < destination_teb.stack_base;
+
+    println!();
+    println!("Destination primary-thread TEB observation");
+    println!("------------------------------------------");
+    println!(
+        "{:<36}{}",
+        "Destination primary TID:", destination_teb.thread_id
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "Captured TEB:", selected_thread.teb_base_address
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "Destination TEB:", destination_teb.teb_base_address
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "Destination TEB Self:", destination_teb.self_pointer
+    );
+    println!("{:<36}{}", "Destination TEB Self:", "VALID");
+    println!(
+        "{:<36}0x{:016X}",
+        "Captured StackLimit:", selected_stack_limit
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "Captured StackBase:", selected_stack_base
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "Destination StackLimit:", destination_teb.stack_limit
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "Destination StackBase:", destination_teb.stack_base
+    );
+    println!("{:<36}{}", "Destination stack bounds:", "VALID");
+    println!(
+        "{:<36}{}",
+        "TEB address relation:",
+        if selected_thread.teb_base_address == destination_teb.teb_base_address {
+            "SAME VALUE; DISTINCT THREAD IDENTITIES"
+        } else {
+            "DIFFERENT"
+        }
+    );
+    println!(
+        "{:<36}{}",
+        "Captured stack metadata:",
+        if captured_stack_matches_destination {
+            "ALREADY MATCHES"
+        } else {
+            "DIFFERS"
+        }
+    );
+    println!(
+        "{:<36}{}",
+        "Captured RSP in dest stack:",
+        if captured_rsp_in_destination_stack {
+            "YES"
+        } else {
+            "NO"
+        }
+    );
+    println!("{:<36}{}", "Observation mode:", "READ ONLY");
+    println!("{:<36}{}", "Destination TEB modified:", "NO");
+    println!("{:<36}{}", "Destination remains stopped:", "YES");
+
     // Still entirely reserved before we begin changing the fences
     // into reconstructed PRIVATE memory.
     for &(base, size) in &reservations {
@@ -3839,6 +3934,126 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
     println!("{:<36}{}", "Stack ownership:", "UNIQUE SELECTED THREAD");
     println!("{:<36}{}", "Reconstructed RSP bytes:", "EXACT");
     println!("{:<36}{}", "Destination remains stopped:", "YES");
+
+    // M4.3 controlled mutation:
+    // only the public x64 NT_TIB StackBase and StackLimit fields are changed.
+    // The destination TEB address, Self pointer, undocumented TEB state, and
+    // CPU context remain destination-owned and untouched.
+    let stack_reconciliation = debug_session
+        .reconcile_primary_thread_stack_bounds(selected_stack_limit, selected_stack_base)
+        .map_err(|error| {
+            format!("failed to reconcile destination primary-thread stack bounds: {error}")
+        })?;
+
+    if stack_reconciliation.before != destination_teb {
+        return Err(
+            "destination TEB changed unexpectedly between read-only observation \
+             and stack reconciliation"
+                .to_string(),
+        );
+    }
+
+    if stack_reconciliation.bytes_written != 16 {
+        return Err(format!(
+            "destination NT_TIB reconciliation wrote {} bytes; expected 16",
+            stack_reconciliation.bytes_written
+        ));
+    }
+
+    if stack_reconciliation.after.teb_base_address != destination_teb.teb_base_address {
+        return Err("destination TEB address changed during reconciliation".to_string());
+    }
+
+    if stack_reconciliation.after.self_pointer != destination_teb.self_pointer
+        || !stack_reconciliation.after.self_pointer_valid()
+    {
+        return Err("destination TEB Self pointer changed during reconciliation".to_string());
+    }
+
+    if stack_reconciliation.after.stack_limit != selected_stack_limit
+        || stack_reconciliation.after.stack_base != selected_stack_base
+    {
+        return Err(
+            "destination NT_TIB stack bounds do not match captured stack after reconciliation"
+                .to_string(),
+        );
+    }
+
+    if selected_context.rsp < stack_reconciliation.after.stack_limit
+        || selected_context.rsp >= stack_reconciliation.after.stack_base
+    {
+        return Err(
+            "captured RSP is not inside reconciled destination NT_TIB stack bounds".to_string(),
+        );
+    }
+
+    println!();
+    println!("Destination NT_TIB stack reconciliation");
+    println!("---------------------------------------");
+    println!(
+        "{:<36}0x{:016X}",
+        "Destination TEB:", stack_reconciliation.after.teb_base_address
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "TEB Self before:", stack_reconciliation.before.self_pointer
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "TEB Self after:", stack_reconciliation.after.self_pointer
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "StackLimit before:", stack_reconciliation.before.stack_limit
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "StackBase before:", stack_reconciliation.before.stack_base
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "StackLimit after:", stack_reconciliation.after.stack_limit
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "StackBase after:", stack_reconciliation.after.stack_base
+    );
+    println!(
+        "{:<36}{}",
+        "NT_TIB bytes written:", stack_reconciliation.bytes_written
+    );
+    println!("{:<36}{}", "Stack bounds readback:", "EXACT");
+    println!("{:<36}{}", "TEB address preserved:", "YES");
+    println!("{:<36}{}", "TEB Self preserved:", "YES");
+    println!("{:<36}{}", "Captured RSP in TEB stack:", "YES");
+    println!("{:<36}{}", "Captured context installed:", "NO");
+    println!("{:<36}{}", "Destination remains stopped:", "YES");
+
+    // This probe is about proving controlled reconciliation, not yet running
+    // captured execution. Restore the Windows-created stack metadata before
+    // releasing WCRE's reconstructed stack memory during cleanup.
+    let cleanup_reconciliation = debug_session
+        .reconcile_primary_thread_stack_bounds(
+            destination_teb.stack_limit,
+            destination_teb.stack_base,
+        )
+        .map_err(|error| {
+            format!("failed to restore destination NT_TIB stack bounds for cleanup: {error}")
+        })?;
+
+    if cleanup_reconciliation.before.stack_limit != selected_stack_limit
+        || cleanup_reconciliation.before.stack_base != selected_stack_base
+    {
+        return Err("cleanup reconciliation did not begin from captured stack bounds".to_string());
+    }
+
+    if cleanup_reconciliation.after != destination_teb {
+        return Err(
+            "destination TEB was not restored exactly to its original observed state".to_string(),
+        );
+    }
+
+    println!("{:<36}{}", "NT_TIB restored for cleanup:", "YES");
 
     println!();
     println!("Controlled cleanup");

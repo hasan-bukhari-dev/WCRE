@@ -6,6 +6,7 @@
 //!
 //! Early restoration primitives are intentionally narrow and do not yet constitute complete process restoration.
 
+mod destination_thread;
 mod exact_allocation;
 mod loader_debug;
 mod memory;
@@ -19,6 +20,10 @@ mod suspended_process;
 pub use memory::{
     MemoryMap, MemoryProtection, MemoryRegion, MemoryState, MemoryType, query_memory_map,
     query_memory_region,
+};
+
+pub use destination_thread::{
+    DestinationThreadStackReconciliation, DestinationThreadTebError, DestinationThreadTebInfo,
 };
 
 pub use exact_allocation::{

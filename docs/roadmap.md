@@ -165,7 +165,11 @@ program from `main()`.
 
 ## M4.1 — Captured application-thread selection
 
-**Next implementation milestone.**
+**Complete.**
+
+WCRE deterministically selects the unique captured application thread whose
+persisted RIP belongs to the captured main executable and validates its
+persisted stack bounds and RSP before destination-thread restoration begins.
 
 Goal:
 
@@ -201,6 +205,16 @@ Acceptance:
 
 ## M4.2 — Destination-thread mapping
 
+**Complete.**
+
+WCRE explicitly maps the selected captured application thread to the fresh
+destination primary thread, verifies that the executable-entry breakpoint
+belongs to that thread, verifies exact executable bytes at the captured RIP,
+and verifies exact reconstructed PRIVATE stack bytes at the captured RSP.
+
+Controlled acceptance passed 5/5 runs. M4.2 does not modify the destination
+TEB, install captured CPU context, or resume captured execution.
+
 Goal:
 
 > Explicitly associate the selected captured application thread with the
@@ -224,6 +238,22 @@ Acceptance:
 - no TEB mutation and no context installation yet.
 
 ## M4.3 — TEB reconciliation
+
+**Complete for the current controlled scope.**
+
+WCRE locates the Windows-created destination primary thread's TEB with
+`NtQueryInformationThread`, preserves the destination TEB address and `Self`
+identity, and reconciles only the public x64 `NT_TIB.StackBase` and
+`NT_TIB.StackLimit` fields to the reconstructed captured stack.
+
+The two adjacent 64-bit fields are changed as one 16-byte operation and read
+back exactly. The captured RSP is then verified to lie inside the reconciled
+stack bounds. In the non-resuming acceptance probe, the original Windows-created
+stack metadata is restored before reconstructed PRIVATE memory is released.
+
+Controlled acceptance passed 5/5 runs. WCRE does not copy the captured TEB
+wholesale, does not claim restoration of undocumented TEB bookkeeping, does
+not install captured CPU context, and does not resume captured execution.
 
 Goal:
 
@@ -260,6 +290,8 @@ Acceptance:
 - no captured CPU context is installed yet.
 
 ## M4.4 — Captured x64 context installation
+
+**Next implementation milestone.**
 
 Goal:
 
