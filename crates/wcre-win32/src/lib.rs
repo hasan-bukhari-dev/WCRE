@@ -16,6 +16,7 @@ mod process;
 mod restore_memory;
 mod snapshot;
 mod suspended_process;
+mod thread_context;
 
 pub use memory::{
     MemoryMap, MemoryProtection, MemoryRegion, MemoryState, MemoryType, query_memory_map,
@@ -44,6 +45,12 @@ pub use loader_debug::{
     LoaderDebugError, LoaderDebugSession, LoaderEntryPointBreakpoint, LoaderInitialBreakpoint,
 };
 pub use suspended_process::{SuspendedProcessError, SuspendedProcessSession};
+
+pub use thread_context::{
+    ContextFieldMismatch, DestinationThreadContextError, DestinationThreadContextInstallation,
+    WINDOWS_X64_EFLAGS_NORMALIZED_MASK, install_destination_thread_context,
+    query_destination_thread_context, x64_contexts_match_after_set_thread_context,
+};
 
 pub use snapshot::{
     SnapshotImage, SnapshotImageReport, SnapshotMemoryComparison, SnapshotPrivateDiff,
