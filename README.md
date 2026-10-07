@@ -299,6 +299,11 @@ Restarting the executable at `main` does not count.
 - fail closed rather than silently approximate unsupported state,
 - no restore claim until captured execution actually resumes,
 - explicit compatibility boundaries,
+- design for portable Windows x64 checkpoint/restore across compatible machines,
+  not around one particular PC,
+- never assume a machine-specific PID, TID, TEB address, virtual address, path,
+  OS/build detail, or similar state unless it is captured, discovered dynamically,
+  or explicitly validated by a compatibility layer,
 - automated verification wherever practical,
 - preserve useful failed experiments,
 - keep platform-independent state separate from Windows-owned structures.

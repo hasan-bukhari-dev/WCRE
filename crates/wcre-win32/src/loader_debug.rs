@@ -637,6 +637,35 @@ impl LoaderDebugSession {
         self.primary_thread_id
     }
 
+    /// Observe WCRE's currently modeled x64 integer/control register subset
+    /// for the stopped Windows-created primary thread.
+    ///
+    /// This does not modify the thread or resume execution.
+    pub fn primary_thread_context(
+        &self,
+    ) -> Result<wcre_image::X64ContextSubset, crate::thread_context::DestinationThreadContextError>
+    {
+        crate::thread_context::query_destination_thread_context(self._primary_thread_handle.raw())
+    }
+
+    /// Install WCRE's persisted x64 integer/control register subset into the
+    /// stopped Windows-created primary thread and immediately verify
+    /// GetThreadContext readback using WCRE's fail-closed x64 policy.
+    ///
+    /// This does not resume execution.
+    pub fn install_primary_thread_context(
+        &self,
+        requested: &wcre_image::X64ContextSubset,
+    ) -> Result<
+        crate::thread_context::DestinationThreadContextInstallation,
+        crate::thread_context::DestinationThreadContextError,
+    > {
+        crate::thread_context::install_destination_thread_context(
+            self._primary_thread_handle.raw(),
+            requested,
+        )
+    }
+
     /// Observe the Windows-created primary thread's current TEB/NT_TIB stack
     /// metadata without modifying the TEB or CPU context.
     pub fn primary_thread_teb_info(

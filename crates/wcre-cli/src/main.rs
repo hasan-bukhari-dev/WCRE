@@ -4026,12 +4026,162 @@ fn run_staged_memory_probe(path: &str) -> Result<(), String> {
     println!("{:<36}{}", "TEB address preserved:", "YES");
     println!("{:<36}{}", "TEB Self preserved:", "YES");
     println!("{:<36}{}", "Captured RSP in TEB stack:", "YES");
-    println!("{:<36}{}", "Captured context installed:", "NO");
     println!("{:<36}{}", "Destination remains stopped:", "YES");
 
-    // This probe is about proving controlled reconciliation, not yet running
-    // captured execution. Restore the Windows-created stack metadata before
-    // releasing WCRE's reconstructed stack memory during cleanup.
+    // M4.4 begins only after WCRE has reconstructed and verified the captured
+    // stack and reconciled the destination NT_TIB stack bounds.
+    //
+    // Observe the Windows-created destination context, install WCRE's
+    // persisted integer/control subset, then verify readback using WCRE's
+    // fail-closed x64 policy while the debugger still owns the stopped thread.
+    let destination_context_before = debug_session.primary_thread_context().map_err(|error| {
+        format!("failed to observe destination primary-thread context before installation: {error}")
+    })?;
+
+    let context_installation = debug_session
+        .install_primary_thread_context(selected_context)
+        .map_err(|error| {
+            format!("failed to install captured primary-thread context into destination: {error}")
+        })?;
+
+    if context_installation.before != destination_context_before {
+        return Err(
+            "destination primary-thread context changed between pre-install observation \
+             and SetThreadContext"
+                .to_string(),
+        );
+    }
+
+    if &context_installation.requested != selected_context {
+        return Err(
+            "context installation did not retain the selected captured context request".to_string(),
+        );
+    }
+
+    if !wcre_win32::x64_contexts_match_after_set_thread_context(
+        selected_context,
+        &context_installation.after,
+    ) {
+        return Err(
+            "destination primary-thread context failed WCRE's SetThreadContext \
+             readback verification policy"
+                .to_string(),
+        );
+    }
+
+    let teb_after_context_install = debug_session.primary_thread_teb_info().map_err(|error| {
+        format!("failed to verify destination TEB after context installation: {error}")
+    })?;
+
+    if teb_after_context_install.process_id != stack_reconciliation.after.process_id
+        || teb_after_context_install.thread_id != stack_reconciliation.after.thread_id
+        || teb_after_context_install.teb_base_address != stack_reconciliation.after.teb_base_address
+        || teb_after_context_install.self_pointer != stack_reconciliation.after.self_pointer
+        || teb_after_context_install.stack_limit != stack_reconciliation.after.stack_limit
+        || teb_after_context_install.stack_base != stack_reconciliation.after.stack_base
+    {
+        return Err(
+            "destination TEB changed unexpectedly during CPU-context installation".to_string(),
+        );
+    }
+
+    println!();
+    println!("Destination primary-thread context installation");
+    println!("-----------------------------------------------");
+    println!(
+        "{:<36}0x{:08X}",
+        "Requested CONTEXT flags:", context_installation.context_flags
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "RIP before:", context_installation.before.rip
+    );
+    println!("{:<36}0x{:016X}", "Captured RIP:", selected_context.rip);
+    println!(
+        "{:<36}0x{:016X}",
+        "RIP readback:", context_installation.after.rip
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "RSP before:", context_installation.before.rsp
+    );
+    println!("{:<36}0x{:016X}", "Captured RSP:", selected_context.rsp);
+    println!(
+        "{:<36}0x{:016X}",
+        "RSP readback:", context_installation.after.rsp
+    );
+    println!(
+        "{:<36}0x{:016X}",
+        "RBP before:", context_installation.before.rbp
+    );
+    println!("{:<36}0x{:016X}", "Captured RBP:", selected_context.rbp);
+    println!(
+        "{:<36}0x{:016X}",
+        "RBP readback:", context_installation.after.rbp
+    );
+    println!(
+        "{:<36}0x{:08X}",
+        "EFLAGS before:", context_installation.before.eflags
+    );
+    println!(
+        "{:<36}0x{:08X}",
+        "Captured EFLAGS:", selected_context.eflags
+    );
+    println!(
+        "{:<36}0x{:08X}",
+        "EFLAGS readback:", context_installation.after.eflags
+    );
+    let eflags_readback_difference = selected_context.eflags ^ context_installation.after.eflags;
+
+    println!("{:<36}{}", "Non-EFLAGS fields:", "17/17 EXACT");
+    println!(
+        "{:<36}0x{:08X}",
+        "EFLAGS readback difference:", eflags_readback_difference
+    );
+    println!(
+        "{:<36}0x{:08X}",
+        "Allowed EFLAGS normalization:",
+        wcre_win32::WINDOWS_X64_EFLAGS_NORMALIZED_MASK
+    );
+    println!("{:<36}{}", "EFLAGS non-normalized bits:", "EXACT");
+    println!("{:<36}{}", "Context verification:", "PASS");
+    println!("{:<36}{}", "Captured context installed:", "YES");
+    println!("{:<36}{}", "TEB preserved:", "YES");
+    println!("{:<36}{}", "Destination remains stopped:", "YES");
+    println!("{:<36}{}", "Captured execution resumed:", "NO");
+
+    // M4.4 remains a stopped-state experiment. Restore the original
+    // Windows-created integer/control subset before restoring the original
+    // NT_TIB stack bounds and releasing reconstructed memory.
+    let context_cleanup = debug_session
+        .install_primary_thread_context(&context_installation.before)
+        .map_err(|error| {
+            format!(
+                "failed to restore original destination primary-thread context for cleanup: {error}"
+            )
+        })?;
+
+    if context_cleanup.before != context_installation.after {
+        return Err(
+            "CPU-context cleanup did not begin from the verified captured context".to_string(),
+        );
+    }
+
+    if !wcre_win32::x64_contexts_match_after_set_thread_context(
+        &context_installation.before,
+        &context_cleanup.after,
+    ) {
+        return Err(
+            "destination primary-thread context failed WCRE's verification policy \
+             while restoring the original context for cleanup"
+                .to_string(),
+        );
+    }
+
+    println!("{:<36}{}", "Context restored for cleanup:", "YES");
+
+    // Restore the Windows-created stack metadata only after the original
+    // destination CPU context has also been restored.
     let cleanup_reconciliation = debug_session
         .reconcile_primary_thread_stack_bounds(
             destination_teb.stack_limit,

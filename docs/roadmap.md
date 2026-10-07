@@ -291,23 +291,32 @@ Acceptance:
 
 ## M4.4 — Captured x64 context installation
 
-**Next implementation milestone.**
+**Complete for the current controlled scope.**
 
 Goal:
 
 > Install WCRE's captured integer/control register subset into the staged
 > destination thread and verify it without resuming execution.
 
-Implementation direction:
+Implemented behavior:
 
-- add a `wcre-win32` thread-context manipulation primitive,
-- obtain the destination Windows `CONTEXT`,
-- overlay the captured WCRE-owned fields,
-- call `SetThreadContext`,
-- immediately call `GetThreadContext`,
-- require exact readback for every field WCRE claims to restore.
+- obtain the stopped destination primary thread's Windows `CONTEXT`,
+- request the x64 control and integer context groups,
+- preserve destination-owned state by overlaying only WCRE-owned fields,
+- install the captured subset with `SetThreadContext`,
+- immediately read the stopped thread back with `GetThreadContext`,
+- require all 17 persisted non-EFLAGS fields to match exactly,
+- allow only the explicitly modeled Windows normalization of EFLAGS bit `0x2`,
+- fail closed on every other EFLAGS difference,
+- verify that the reconciled destination TEB remains unchanged,
+- restore the original destination CPU context before restoring original
+  NT_TIB stack metadata and releasing reconstructed PRIVATE memory.
 
-Current persisted fields include:
+The native x64 `CONTEXT` storage used at the Win32 boundary is explicitly
+16-byte aligned. This was required for reliable `GetThreadContext` and
+`SetThreadContext` operation in the controlled experiment.
+
+Current persisted fields are:
 
 ```text
 RAX RBX RCX RDX
@@ -317,14 +326,28 @@ RIP RSP RBP
 EFLAGS
 ```
 
-This is intentionally not yet a complete Win64 execution context.
+This remains intentionally narrower than a complete Win64 execution context.
+Floating-point, SIMD/vector, debug-register, and extended XSTATE restoration
+are still outside the current claim.
 
-Acceptance:
+Controlled acceptance passed **5/5 runs**. Across those runs:
 
-- captured register subset installs successfully,
-- readback matches exactly,
-- destination remains stopped,
-- no execution continuation claim is made.
+- each destination used dynamically discovered process and primary-thread IDs,
+- the captured register subset installed successfully,
+- all 17 non-EFLAGS fields read back exactly,
+- the observed EFLAGS difference was consistently `0x00000002`,
+- all non-normalized EFLAGS bits matched,
+- context verification passed fail-closed,
+- destination TEB identity and reconciled stack metadata remained intact,
+- the original destination CPU context was restored for cleanup,
+- the original destination NT_TIB stack metadata was restored for cleanup,
+- reconstructed PRIVATE allocations were released,
+- the destination was terminated cleanly,
+- captured execution was never resumed.
+
+M4.4 therefore proves stopped-state installation and verified readback of the
+persisted WCRE x64 integer/control subset in the controlled target. It does
+**not** prove execution continuation or general Windows process restoration.
 
 ## M4.5 — First controlled execution continuation
 
